@@ -14,119 +14,126 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
+"""
+Specialized utility functions for surface-only DoMINO datasets.
 
+This file contains modified versions of the original utility functions,
+removing all references and logic related to volumetric data, and focusing
+solely on surface fields, mesh data, and global parameters.
+"""
+
+import os
+import pickle
 from dataclasses import dataclass
-from typing import Dict, Optional, Any
+from pathlib import Path
+from typing import Dict, Optional, Literal, Any
+
 import numpy as np
 import torch
 import torch.distributed as dist
-import pickle
-from pathlib import Path
-from typing import Literal
 from omegaconf import DictConfig
 from physicsnemo.distributed import DistributedManager
-
 from torch.distributed.tensor.placement_types import (
     Shard,
     Replicate,
 )
 
 
-def get_num_vars(cfg: dict, model_type: Literal["volume", "surface", "combined"]):
-    """Calculate the number of variables for volume, surface, and global features.
+# ==============================================================================
+# Helper functions (Adapted for Surface-Only)
+# ==============================================================================
+
+def get_num_vars_surface_only(cfg: dict) -> tuple[int | None, int]:
+    """Calculate the number of variables for surface and global features.
 
     This function analyzes the configuration to determine how many variables are needed
-    for different mesh data types based on the model type. Vector variables contribute
-    3 components (x, y, z) while scalar variables contribute 1 component each.
+    for surface mesh data and global parameters.
 
     Args:
-        cfg: Configuration object containing variable definitions for volume, surface,
-             and global parameters with their types (scalar/vector).
-        model_type (str): Type of model - can be "volume", "surface", or "combined".
-                         Determines which variable types are included in the count.
+        cfg: Configuration object containing variable definitions for surface and
+             global parameters with their types (scalar/vector).
 
     Returns:
-        tuple: A 3-tuple containing:
-            - num_vol_vars (int or None): Number of volume variables. None if model_type
-              is not "volume" or "combined".
-            - num_surf_vars (int or None): Number of surface variables. None if model_type
-              is not "surface" or "combined".
+        tuple: A 2-tuple containing:
+            - num_surf_vars (int): Number of surface variables.
             - num_global_features (int): Number of global parameter features.
     """
-    num_vol_vars = 0
-    volume_variable_names = []
-    if model_type == "volume" or model_type == "combined":
-        volume_variable_names = list(cfg.variables.volume.solution.keys())
-        for j in volume_variable_names:
-            if cfg.variables.volume.solution[j] == "vector":
-                num_vol_vars += 3
-            else:
-                num_vol_vars += 1
-    else:
-        num_vol_vars = None
+    # Volume logic removed
+    num_vol_vars = None
 
     num_surf_vars = 0
-    surface_variable_names = []
-    if model_type == "surface" or model_type == "combined":
-        surface_variable_names = list(cfg.variables.surface.solution.keys())
-        num_surf_vars = 0
-        for j in surface_variable_names:
-            if cfg.variables.surface.solution[j] == "vector":
-                num_surf_vars += 3
-            else:
-                num_surf_vars += 1
-    else:
-        num_surf_vars = None
+    surface_variable_names = list(cfg.variables.surface.solution.keys())
+    for j in surface_variable_names:
+        if cfg.variables.surface.solution[j] == "vector":
+            num_surf_vars += 3
+        else:
+            num_surf_vars += 1
 
     num_global_features = 0
     global_params_names = list(cfg.variables.global_parameters.keys())
     for param in global_params_names:
-        if cfg.variables.global_parameters[param].type == "vector":
-            num_global_features += len(cfg.variables.global_parameters[param].reference)
-        elif cfg.variables.global_parameters[param].type == "scalar":
+        # Assuming the config structure for global parameters remains the same
+        # i.e., it has a 'type' and 'reference' field.
+        param_config = cfg.variables.global_parameters[param]
+        if param_config.type == "vector":
+            # For vector, use the length of the reference list
+            if isinstance(param_config.reference, list):
+                num_global_features += len(param_config.reference)
+            else:
+                # If it's a simple list in config, or otherwise structured
+                # QUESTION: How are vector global parameters represented? If they are
+                # always 3D, use 3. If they are based on 'reference', use its length.
+                # Assuming simple 3-component vector for safety, but check the 'reference' field if available.
+                num_global_features += 3
+        elif param_config.type == "scalar":
             num_global_features += 1
         else:
-            raise ValueError(f"Unknown global parameter type")
+            raise ValueError(f"Unknown global parameter type for {param}")
 
-    return num_vol_vars, num_surf_vars, num_global_features
+    return num_surf_vars, num_global_features
 
 
-def get_keys_to_read(
+def get_keys_to_read_surface_only(
     cfg: dict,
-    model_type: Literal["volume", "surface", "combined"],
     get_ground_truth: bool = True,
 ):
     """
-    This function helps configure the keys to read from the dataset.
+    Configures the keys to read from the dataset for a surface-only model.
 
-    And, if some global parameter values are provided in the config,
-    they are also read here and passed to the dataset.
+    Args:
+        cfg: Configuration object.
+        get_ground_truth: Boolean to include ground truth surface fields.
 
+    Returns:
+        tuple: A 2-tuple containing:
+            - keys_to_read (list[str]): List of keys to be loaded from the dataset.
+            - keys_to_read_if_available (dict): Dictionary of default values for
+              keys that may be missing, like global parameters.
     """
 
     # Always read these keys:
     keys_to_read = ["stl_coordinates", "stl_centers", "stl_faces", "stl_areas"]
 
-    # If these keys are in the config, use them, else provide defaults in
-    # case they aren't in the dataset:
+    # Global parameter defaults:
     cfg_params_vec = []
     for key in cfg.variables.global_parameters:
-        if cfg.variables.global_parameters[key].type == "vector":
-            cfg_params_vec.extend(cfg.variables.global_parameters[key].reference)
+        param_config = cfg.variables.global_parameters[key]
+        if param_config.type == "vector":
+            # Assuming 'reference' is a list/tuple of values for vector params
+            if isinstance(param_config.reference, (list, tuple)):
+                cfg_params_vec.extend(param_config.reference)
+            else:
+                # Fallback, assuming a 3-component vector if reference is not a list
+                cfg_params_vec.extend([param_config.reference] * 3)
         else:
-            cfg_params_vec.append(cfg.variables.global_parameters[key].reference)
+            cfg_params_vec.append(param_config.reference)
+
+    # NOTE: The exact key name for the values array ("global_params_values" or otherwise)
+    # must be confirmed based on your dataset structure.
     keys_to_read_if_available = {
         "global_params_values": torch.tensor(cfg_params_vec).reshape(-1, 1),
         "global_params_reference": torch.tensor(cfg_params_vec).reshape(-1, 1),
     }
-
-    # Volume keys:
-    volume_keys = [
-        "volume_mesh_centers",
-    ]
-    if get_ground_truth:
-        volume_keys.append("volume_fields")
 
     # Surface keys:
     surface_keys = [
@@ -137,37 +144,28 @@ def get_keys_to_read(
     if get_ground_truth:
         surface_keys.append("surface_fields")
 
-    if model_type == "volume" or model_type == "combined":
-        keys_to_read.extend(volume_keys)
-    if model_type == "surface" or model_type == "combined":
-        keys_to_read.extend(surface_keys)
+    keys_to_read.extend(surface_keys)
 
     return keys_to_read, keys_to_read_if_available
 
 
-def coordinate_distributed_environment(cfg: DictConfig):
+def coordinate_distributed_environment_surface_only(cfg: DictConfig):
     """
-    Initialize the distributed env for DoMINO.  This is actually always a 2D Mesh:
-    one dimension is the data-parallel dimension (DDP), and the other is the
-    domain dimension.
-
-    For the training scripts, we need to know the rank, size of each dimension,
-    and return the domain_mesh and placements for the loader.
+    Initialize the distributed env for DoMINO, focusing on surface data placements.
 
     Args:
         cfg: Configuration object containing the domain parallelism configuration.
 
     Returns:
-        domain_mesh: torch.distributed.DeviceMesh: The domain mesh for the domain parallel dimension.
-        data_mesh: torch.distributed.DeviceMesh: The data mesh for the data parallel dimension.
-        placements: dict[str, torch.distributed.tensor.Placement]: The placements for the data set
+        domain_mesh: torch.distributed.DeviceMesh: The domain mesh.
+        data_mesh: torch.distributed.DeviceMesh: The data mesh.
+        placements: dict[str, torch.distributed.tensor.Placement]: The placements.
     """
 
     if not DistributedManager.is_initialized():
         DistributedManager.initialize()
     dist = DistributedManager()
 
-    # Default to no domain parallelism:
     domain_size = cfg.get("domain_parallelism", {}).get("domain_size", 1)
 
     if dist.world_size == 1:
@@ -183,12 +181,6 @@ def coordinate_distributed_environment(cfg: DictConfig):
         data_mesh = mesh["ddp"]
 
         if domain_size > 1:
-            # Define the default placements for each tensor that might show up in
-            # the data.  Note that we'll define placements for all keys, even if
-            # they aren't actually used.
-
-            # Note that placements are defined for pre-batched data, no batch index!
-
             shard_grid = cfg.get("domain_parallelism", {}).get("shard_grid", False)
             shard_points = cfg.get("domain_parallelism", {}).get("shard_points", False)
 
@@ -197,20 +189,10 @@ def coordinate_distributed_environment(cfg: DictConfig):
                     "Either shard_grid or shard_points must be True if domain_size > 1"
                 )
 
-            # Not supported with physics loss:
             if cfg.train.add_physics_loss:
                 raise ValueError(
                     "Domain parallelism is not supported with physics loss"
                 )
-
-            if shard_grid:
-                grid_like_placement = [
-                    Shard(0),
-                ]
-            else:
-                grid_like_placement = [
-                    Replicate(),
-                ]
 
             if shard_points:
                 point_like_placement = [
@@ -221,14 +203,13 @@ def coordinate_distributed_environment(cfg: DictConfig):
                     Replicate(),
                 ]
 
+            # Define placements only for keys relevant to a surface model
             placements = {
                 "stl_coordinates": point_like_placement,
                 "stl_centers": point_like_placement,
                 "stl_faces": point_like_placement,
                 "stl_areas": point_like_placement,
                 "surface_fields": point_like_placement,
-                "volume_mesh_centers": point_like_placement,
-                "volume_fields": point_like_placement,
                 "surface_mesh_centers": point_like_placement,
                 "surface_normals": point_like_placement,
                 "surface_areas": point_like_placement,
@@ -244,17 +225,7 @@ def coordinate_distributed_environment(cfg: DictConfig):
 class ScalingFactors:
     """
     Data structure for storing scaling factors computed for DoMINO datasets.
-
-    This class provides a clean, easily serializable format for storing
-    mean, std, min, and max values for different array keys in the dataset.
-    Uses numpy arrays for easy serialization and cross-platform compatibility.
-
-    Attributes:
-        mean: Dictionary mapping keys to mean numpy arrays
-        std: Dictionary mapping keys to standard deviation numpy arrays
-        min_val: Dictionary mapping keys to minimum value numpy arrays
-        max_val: Dictionary mapping keys to maximum value numpy arrays
-        field_keys: List of field keys for which statistics were computed
+    (No changes needed here as it is data agnostic)
     """
 
     mean: Dict[str, np.ndarray]
@@ -311,19 +282,31 @@ class ScalingFactors:
             max_val = self.max_val[key]
 
             summary.append(f"\n{key}:")
-            summary.append(f"  Shape: {mean_val.shape}")
-            summary.append(f"  Mean: {mean_val}")
-            summary.append(f"  Std: {std_val}")
-            summary.append(f"  Min: {min_val}")
-            summary.append(f"  Max: {max_val}")
+            summary.append(f"   Shape: {mean_val.shape}")
+            summary.append(f"   Mean: {mean_val}")
+            summary.append(f"   Std: {std_val}")
+            summary.append(f"   Min: {min_val}")
+            summary.append(f"   Max: {max_val}")
 
         return "\n".join(summary)
 
 
-def load_scaling_factors(
+def load_scaling_factors_surface_only(
     cfg: DictConfig, logger=None
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Load scaling factors from the configuration."""
+) -> torch.Tensor:
+    """Load scaling factors from the configuration for surface fields only.
+
+    NOTE: The return type is changed from a tuple to a single torch.Tensor
+    containing the surface scaling factors.
+
+    Args:
+        cfg: Hydra configuration object.
+        logger: Optional logger instance.
+
+    Returns:
+        torch.Tensor: Tensor containing surface field scaling factors
+                      ([max/mean, min/std] x num_surface_vars).
+    """
     pickle_path = os.path.join(cfg.data.scaling_factors)
 
     try:
@@ -334,14 +317,14 @@ def load_scaling_factors(
         raise FileNotFoundError(
             f"Scaling factors not found at: {pickle_path}; please run compute_statistics.py to compute them."
         )
+    
+    # Check if 'surface_fields' key exists, which is mandatory for a surface model
+    if 'surface_fields' not in scaling_factors.field_keys:
+        raise ValueError(
+            "Scaling factors file is missing 'surface_fields' key. Was it computed correctly?"
+        )
 
     if cfg.model.normalization == "min_max_scaling":
-        vol_factors = np.asarray(
-            [
-                scaling_factors.max_val["volume_fields"],
-                scaling_factors.min_val["volume_fields"],
-            ]
-        )
         surf_factors = np.asarray(
             [
                 scaling_factors.max_val["surface_fields"],
@@ -349,12 +332,6 @@ def load_scaling_factors(
             ]
         )
     elif cfg.model.normalization == "mean_std_scaling":
-        vol_factors = np.asarray(
-            [
-                scaling_factors.mean["volume_fields"],
-                scaling_factors.std["volume_fields"],
-            ]
-        )
         surf_factors = np.asarray(
             [
                 scaling_factors.mean["surface_fields"],
@@ -364,48 +341,50 @@ def load_scaling_factors(
     else:
         raise ValueError(f"Invalid normalization mode: {cfg.model.normalization}")
 
-    vol_factors_tensor = torch.from_numpy(vol_factors)
     surf_factors_tensor = torch.from_numpy(surf_factors)
 
     dm = DistributedManager()
-    vol_factors_tensor = vol_factors_tensor.to(dm.device, dtype=torch.float32)
     surf_factors_tensor = surf_factors_tensor.to(dm.device, dtype=torch.float32)
 
-    return vol_factors_tensor, surf_factors_tensor
+    return surf_factors_tensor
 
 
-def compute_l2(
-    pred_surface: torch.Tensor | None,
-    pred_volume: torch.Tensor | None,
-    batch,
+def compute_l2_surface_only(
+    pred_surface: torch.Tensor,
+    batch: Dict[str, Any],
     dataloader,
 ) -> dict[str, torch.Tensor]:
     """
-    Compute the L2 norm between prediction and target.
+    Compute the L2 norm between surface prediction and target.
 
-    Requires the dataloader to unscale back to original values
+    Requires the dataloader to unscale back to original values.
+
+    Args:
+        pred_surface: The predicted surface fields (normalized).
+        batch: The batch dictionary containing the target fields.
+        dataloader: The dataloader instance with unscaling method.
+
+    Returns:
+        dict[str, torch.Tensor]: Dictionary of L2 metrics for surface components.
     """
 
     l2_dict = {}
 
-    if pred_surface is not None:
-        _, target_surface = dataloader.unscale_model_outputs(
-            surface_fields=batch["surface_fields"]
-        )
-        _, pred_surface = dataloader.unscale_model_outputs(surface_fields=pred_surface)
-        l2_surface = metrics_fn_surface(pred_surface, target_surface)
-        l2_dict.update(l2_surface)
-    if pred_volume is not None:
-        target_volume, _ = dataloader.unscale_model_outputs(
-            volume_fields=batch["volume_fields"]
-        )
-        pred_volume, _ = dataloader.unscale_model_outputs(volume_fields=pred_volume)
-        l2_volume = metrics_fn_volume(pred_volume, target_volume)
-        l2_dict.update(l2_volume)
+    _, target_surface = dataloader.unscale_model_outputs(
+        # Pass None for volume fields as they are not needed
+        volume_fields=None, 
+        surface_fields=batch["surface_fields"]
+    )
+    _, pred_surface = dataloader.unscale_model_outputs(
+        volume_fields=None, 
+        surface_fields=pred_surface
+    )
+    l2_surface = metrics_fn_surface(pred_surface, target_surface)
+    l2_dict.update(l2_surface)
 
     return l2_dict
 
-
+# NOTE: metrics_fn_surface remains unchanged as it is already surface-specific.
 def metrics_fn_surface(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -414,8 +393,8 @@ def metrics_fn_surface(
     Computes L2 surface metrics between prediction and target.
 
     Args:
-        pred: Predicted values (normalized).
-        target: Target values (normalized).
+        pred: Predicted values (unscaled).
+        target: Target values (unscaled).
 
     Returns:
         Dictionary of L2 surface metrics for pressure and shear components.
@@ -429,8 +408,10 @@ def metrics_fn_surface(
     l2_denom = torch.sum(l2_denom, dim=1)
     l2_denom = torch.sqrt(l2_denom)
 
-    l2 = l2_num / (l2_denom+1e-6)
+    l2 = l2_num / l2_denom
 
+    # NOTE: This assumes the order of surface variables in the tensor is:
+    # [pMeanTrim (scalar), wallShearStressMeanTrim (vector x, y, z)]
     metrics = {
         "l2_surf_pressure": torch.mean(l2[:, 0]),
         "l2_shear_x": torch.mean(l2[:, 1]),
@@ -440,40 +421,14 @@ def metrics_fn_surface(
 
     return metrics
 
-
-def metrics_fn_volume(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-) -> dict[str, torch.Tensor]:
-    """
-    Computes L2 volume metrics between prediction and target.
-    """
-    l2_num = (pred - target) ** 2
-    l2_num = torch.sum(l2_num, dim=1)
-    l2_num = torch.sqrt(l2_num)
-
-    l2_denom = target**2
-    l2_denom = torch.sum(l2_denom, dim=1)
-    l2_denom = torch.sqrt(l2_denom)
-
-    l2 = l2_num / l2_denom
-
-    metrics = {
-        "l2_vol_pressure": torch.mean(l2[:, 3]),
-        "l2_velocity_x": torch.mean(l2[:, 0]),
-        "l2_velocity_y": torch.mean(l2[:, 1]),
-        "l2_velocity_z": torch.mean(l2[:, 2]),
-        "l2_nut": torch.mean(l2[:, 4]),
-    }
-
-    return metrics
-
+# metrics_fn_volume is removed as it's not applicable.
 
 def all_reduce_dict(
     metrics: dict[str, torch.Tensor], dm: DistributedManager
 ) -> dict[str, torch.Tensor]:
     """
     Reduces a dictionary of metrics across all distributed processes.
+    (No changes needed here as it is general distributed utility)
 
     Args:
         metrics: Dictionary of metric names to torch.Tensor values.

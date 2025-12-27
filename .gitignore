@@ -174,3 +174,5 @@ multirun/
 # SLURM
 slurm-*.out
 sbatch_logs/
+naca0012/
+NACA0012_SurfaceFlow/

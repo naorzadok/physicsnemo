@@ -21,16 +21,15 @@ defaults:
 exp_tag: cached
 
 data: # Input directory for training and validation data
-  input_dir: /workspace/naca0012/train
-  input_dir_val: /workspace/naca0012/val
-  input_dir_test: /workspace/naca0012/test
+  input_dir: /lustre/cached/drivaer_aws/drivaer_data_full/train/
+  input_dir_val: /lustre/cached/drivaer_aws/drivaer_data_full/val/
 data_processor:
   use_cache: true
 
 train: # Training configurable parameters
   dataloader:
-    num_workers: 8
+    num_workers: 12
 
 val: # Validation configurable parameters
   dataloader:
-    num_workers: 1
+    num_workers: 6

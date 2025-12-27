@@ -40,6 +40,9 @@ from physicsnemo.launch.logging import PythonLogger, RankZeroLoggingWrapper
 from physicsnemo.datapipes.cae.domino_datapipe import compute_scaling_factors
 from utils import ScalingFactors
 
+# --- ADD THIS LINE ---
+EPSILON = 1e-6 # Small constant to prevent division by zero during normalization
+# ---------------------
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
@@ -111,6 +114,24 @@ def main(cfg: DictConfig) -> None:
         min_val = {k: m.cpu().numpy() for k, m in min_val.items()}
         max_val = {k: m.cpu().numpy() for k, m in max_val.items()}
 
+        # ################################
+        # # FIX: Ensure no standard deviation is zero
+        # ################################
+        for key, s in std.items():
+            # Identify elements in the std array that are too close to zero
+            zero_mask = s < EPSILON 
+            # Replace these elements with EPSILON
+            s[zero_mask] = EPSILON
+            std[key] = s
+            
+        for key, s in max_val.items():
+            # Identify elements in the std array that are too close to zero
+            zero_mask = s < EPSILON 
+            # Replace these elements with EPSILON
+            s[zero_mask] = EPSILON
+            max_val[key] = s
+        # ################################
+        
         compute_time = time.perf_counter() - start_time
         logger.info(
             f"Scaling factors computation completed in {compute_time:.2f} seconds"
