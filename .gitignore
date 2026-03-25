@@ -176,3 +176,8 @@ slurm-*.out
 sbatch_logs/
 naca0012/
 NACA0012_SurfaceFlow/
+examples/cfd/external_aerodynamics/NACA0012_partitions/
+examples/cfd/external_aerodynamics/NACA0012_partitions_2part/
+examples/cfd/external_aerodynamics/xaeronet/surface/NACA0012_partitions/
+examples/cfd/external_aerodynamics/xaeronet/surface/point_clouds/
+NACA0012_SurfaceFlow_sub/

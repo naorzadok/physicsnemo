@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -23,40 +23,37 @@ hydra:
 
 # ┌───────────────────────────────────────────┐
 # │            Data Preprocessing             │
-# └───────────────────────────────────────────┘  
+# └───────────────────────────────────────────┘
 
-num_nodes: [64,128]                  # Number of nodes in the graphs
+num_nodes: [100000, 200000, 400000]                  # Number of nodes in the graphs
 node_degree: 6                                       # Degree of the nodes in the graphs
-num_partitions: 1                                    # Number of partitions for each graph
-data_path: /workspace/NACA0012_SurfaceFlow_sub       # Path to the raw data
-epsilon: 1e-8
-num_preprocess_workers: 1                            # Number of workers for data preprocessing
-save_point_clouds: true                             # Save point clouds for the preprocessed data
-last_lvl_OG: true                             # Keep the last level as the original graph
+num_partitions: 3                                    # Number of partitions for each graph
+data_path: /data/drivaer_aws/drivaer_data_full       # Path to the raw data
+num_preprocess_workers: 32                           # Number of workers for data preprocessing
+save_point_clouds: false                             # Save point clouds for the preprocessed data
 
 # ┌───────────────────────────────────────────┐
 # │           Model Configuration             │
 # └───────────────────────────────────────────┘
 
-num_message_passing_layers: 9                       # Number of message passing layers
-hidden_dim: 256                                      # Hidden dimension of the model
-processor_hidden_dim: 128                                      # Hidden dimension of the model
+num_message_passing_layers: 15                       # Number of message passing layers
+hidden_dim: 512                                      # Hidden dimension of the model
 activation: silu                                     # Activation function
 
 # ┌───────────────────────────────────────────┐
 # │          Training Configuration           │
 # └───────────────────────────────────────────┘
-partitions_path: NACA0012_partitions
-train_partitions_path: ${partitions_path}/train_partitions          # Path to the partitions (.bin files)
-validation_partitions_path: ${partitions_path}/validation_partitions  # Path to the validation partitions (.bin files)
-test_partitions_path: ${partitions_path}/test_partitions  # Path to the validation partitions (.bin files)
+
+partitions_path: partitions                         # Path to the partitions (.bin files)
+validation_partitions_path: validation_partitions   # Path to the validation partitions (.bin files)
+test_partitions_path: test_partitions               # Path to the test partitions (.bin files)
 stats_file: global_stats.json                       # Path to the global statistics (.json file)
 checkpoint_filename: model_checkpoint.pth           # Filename of the model checkpoint
-num_epochs: 1000                                    # Number of epochs
-start_lr: 1e-3                                     # Initial learning rate (cos annealing schedule is used) 
-end_lr: 1e-6                                   # Final learning rate (cos annealing schedule is used)                                   
-save_checkpoint_freq: 10                             # Frequency of saving the model checkpoint
-validation_freq: 100                                 # Frequency of validation
+num_epochs: 2000                                    # Number of epochs
+start_lr: 0.001                                     # Initial learning rate (cos annealing schedule is used)
+end_lr: 0.000001                                    # Final learning rate (cos annealing schedule is used)
+save_checkpoint_freq: 5                             # Frequency of saving the model checkpoint
+validation_freq: 50                                 # Frequency of validation
 
 # ┌───────────────────────────────────────────┐
 # │        Performance Optimization           │
