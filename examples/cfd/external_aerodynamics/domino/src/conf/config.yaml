@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 - 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-FileCopyrightText: All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -18,7 +18,7 @@
 # │            Project Details                │
 # └───────────────────────────────────────────┘  
 project: # Project name
-  name: naca0012
+  name: DrivAerML_Dataset
   
 exp_tag: 1 # Experiment tag
 # Main output directory.
@@ -37,12 +37,12 @@ resume_dir: ${output}/models
 # │            Data Preprocessing             │
 # └───────────────────────────────────────────┘  
 data_processor: # Data processor configurable parameters
-  kind: ${project.name} # must be either drivesim or drivaer_aws
-  output_dir: /user/${data_processor.kind}_all/
-  input_dir: /data/${data_processor.kind}/${data_processor.kind}_full/
-  cached_dir: /user/cached/${data_processor.kind}/${data_processor.kind}_full/
+  kind: drivaer_aws # must be either drivesim or drivaer_aws
+  output_dir: /user/aws_data_all/
+  input_dir: /data/drivaer_aws/drivaer_data_full/
+  cached_dir: /user/cached/drivaer_aws/drivaer_data_full/
   use_cache: false
-  num_processors: 16
+  num_processors: 12
 
 # ┌───────────────────────────────────────────┐
 # │            Solution variables             │
@@ -50,31 +50,29 @@ data_processor: # Data processor configurable parameters
 variables:
   surface:
     solution:
-      Pressure_Coefficient: scalar
-      Skin_Friction_Coefficient: vector
+      # The following is for AWS DrivAer dataset.
+      pMeanTrim: scalar
+      wallShearStressMeanTrim: vector
   volume:
     solution:
+      # The following is for AWS DrivAer dataset.
       UMeanTrim: vector
       pMeanTrim: scalar
       nutMeanTrim: scalar
   global_parameters:
-    AOA:
+    inlet_velocity:
+      type: vector
+      reference: [30.00] # vector [30, 0, 0] should be specified as [30], while [30, 30, 0] should be [30, 30].
+    air_density:
       type: scalar
-      reference: 10 # vector [30, 0, 0] should be specified as [30], while [30, 30, 0] should be [30, 30].
-    Mach:
-      type: scalar
-      reference: 1
-    ReL:
-      type: scalar
-      reference: 6.3
+      reference: 1.205
 
 # ┌───────────────────────────────────────────┐
-# │          Training Data Configs            │
+# │         Data Configs                      │
 # └───────────────────────────────────────────┘  
 data: # Input directory for training and validation data
-  input_dir: /workspace/naca0012/train
-  input_dir_val: /workspace/naca0012/val
-  input_dir_test: /workspace/naca0012/test
+  input_dir: /user/data/aws_data_all/
+  input_dir_val: /user/data/aws_data_all_val/
   bounding_box: # Bounding box dimensions for computational domain
     min: [-3.5, -2.25, -0.32]
     max: [8.5, 2.25, 3.00]
@@ -85,10 +83,11 @@ data: # Input directory for training and validation data
   gpu_output: true
   normalize_coordinates: true
   sample_in_bbox: true
-  sampling: false
-  scaling_factors: /workspace/scaling_factors/scaling_factors.pkl
-  volume_sample_from_disk: false
-  max_samples_for_statistics: 10
+  sampling: true
+  scaling_factors: ${project_dir}/scaling_factors/scaling_factors.pkl
+  volume_sample_from_disk: true
+  max_samples_for_statistics: 200
+
 # ┌───────────────────────────────────────────┐
 # │          Domain Parallelism Settings      │
 # └───────────────────────────────────────────┘  
@@ -101,29 +100,29 @@ domain_parallelism:
 # │          Model Parameters                 │
 # └───────────────────────────────────────────┘  
 model:
-  model_type: surface # train which model? surface, volume, combined
+  model_type: combined # train which model? surface, volume, combined
   activation: "gelu" # "relu" or "gelu"
   loss_function: 
     loss_type: "mse" # mse or rmse
     area_weighing_factor: 10000 # Generally inverse of maximum area
   interp_res: [128, 64, 64] # resolution of latent space 128, 64, 48
-  use_sdf_in_basis_func: false # SDF in basis function network
+  use_sdf_in_basis_func: true # SDF in basis function network
   volume_points_sample: 8192 # Number of points to sample in volume per epoch
-  surface_points_sample: 256 # Number of points to sample on surface per epoch
+  surface_points_sample: 8192 # Number of points to sample on surface per epoch
   surface_sampling_algorithm: area_weighted #random or area_weighted
-  geom_points_sample: 1_024 # Number of points to sample on STL per epoch
-  num_neighbors_surface: 2 # How many neighbors on surface?
+  geom_points_sample: 300_000 # Number of points to sample on STL per epoch
+  num_neighbors_surface: 7 # How many neighbors on surface?
   num_neighbors_volume: 10 # How many neighbors on volume?
   combine_volume_surface: false # combine volume and surface encodings
   return_volume_neighbors: false # Whether to return volume neighbors or not
   use_surface_normals: true # Use surface normals and surface areas for surface computation?
   use_surface_area: true # Use only surface normals and not surface area
   integral_loss_scaling_factor: 100 # Scale integral loss by this factor
-  normalization: mean_std_scaling # min_max_scaling # or mean_std_scaling
-  encode_parameters: true # encode inlet velocity and air density in the model
+  normalization: min_max_scaling # or mean_std_scaling
+  encode_parameters: false # encode inlet velocity and air density in the model
   surf_loss_scaling: 5.0 # scale surface loss with this factor in combined mode
   vol_loss_scaling: 1.0 # scale volume loss with this factor in combined mode
-  geometry_encoding_type: stl # geometry encoder type, sdf, stl, both
+  geometry_encoding_type: both # geometry encoder type, sdf, stl, both
   solution_calculation_mode: two-loop # one-loop is better for sharded, two-loop is lower memory but more overhead. Physics losses are not supported via one-loop presently.
   geometry_rep: # Hyperparameters for geometry representation network
     geo_conv:
@@ -148,17 +147,17 @@ model:
       surface_sdf_scaling_factor: [0.01, 0.02, 0.04] # Scaling factor for SDF, smaller is more emphasis on surface
       volume_sdf_scaling_factor: [0.04] # Scaling factor for SDF, smaller is more emphasis on surface
   nn_basis_functions: # Hyperparameters for basis function network
-    base_layer: 128
+    base_layer: 512
     fourier_features: true
     num_modes: 5
     activation: ${model.activation}
   local_point_conv:
     activation: ${model.activation}
   aggregation_model: # Hyperparameters for aggregation network
-    base_layer: 128
+    base_layer: 512
     activation: ${model.activation}
   position_encoder: # Hyperparameters for position encoding network
-    base_neurons: 128
+    base_neurons: 512
     activation: ${model.activation}
     fourier_features: true
     num_modes: 5
@@ -167,9 +166,9 @@ model:
     surface_neighbors_in_radius: [32, 128] # Number of radius points
     volume_radii: [0.1, 0.25] # Volume radii
     surface_radii: [0.05, 0.25] # Surface radii
-    base_layer: 128
+    base_layer: 512
   parameter_model:
-    base_layer: 128
+    base_layer: 512
     fourier_features: false
     num_modes: 5
     activation: ${model.activation}
@@ -181,13 +180,13 @@ train: # Training configurable parameters
   epochs: 1000
   checkpoint_interval: 2
   dataloader:
-    batch_size: 128
-    preload_depth: 4
-    pin_memory: True # if the preprocessing is outputing GPU data, set this to false
+    batch_size: 1
+    preload_depth: 1
+    pin_memory: True # if the preprocessing is outputting GPU data, set this to false
   sampler:
     shuffle: true
     drop_last: false
-  checkpoint_dir: /user/models/ # Use only for retraining
+  checkpoint_dir: /user/models/ # deprecated: Use only for retraining
   add_physics_loss: false
   lr_scheduler:
     name: MultiStepLR # Also supports CosineAnnealingLR  
@@ -198,14 +197,14 @@ train: # Training configurable parameters
   optimizer:
     name: Adam # or AdamW
     lr: 0.001
-    weight_decay: 1e-5
+    weight_decay: 0.0
   amp:
     enabled: true
     autocast:
       dtype: torch.float16
     scaler:
       _target_: torch.cuda.amp.GradScaler
-      enabled: true
+      enabled: ${..enabled}
     clip_grad: true
     grad_max_norm: 2.0
 
@@ -215,9 +214,9 @@ train: # Training configurable parameters
 # └───────────────────────────────────────────┘  
 val: # Validation configurable parameters
   dataloader:
-    batch_size: 16
-    preload_depth: 4
-    pin_memory: true # if the preprocessing is outputing GPU data, set this to false
+    batch_size: 1
+    preload_depth: 1
+    pin_memory: true # if the preprocessing is outputting GPU data, set this to false
   sampler:
     shuffle: true
     drop_last: false
@@ -226,11 +225,11 @@ val: # Validation configurable parameters
 # │          Testing data Configs             │
 # └───────────────────────────────────────────┘  
 eval: # Testing configurable parameters
-  test_path: /workspace/naca0012/testing_data # Dir for testing data in raw format (vtp, vtu ,stls)
-  save_path: /workspace/naca0012/predicted_data # Dir to save predicted results in raw format (vtp, vtu)
+  test_path: /user/testing_data # Dir for testing data in raw format (vtp, vtu ,stls)
+  save_path: /user/predicted_data # Dir to save predicted results in raw format (vtp, vtu)
   checkpoint_name: DoMINO.0.455.pt # Name of checkpoint to select from saved checkpoints
-  scaling_param_path: /workspace/naca0012/scaling_params
+  scaling_param_path: /user/scaling_params
   refine_stl: False # Automatically refine STL during inference
   #TODO -  This was hardcoded anyways, remove it.
   # stencil_size: 7 # Stencil size for evaluating surface and volume model
-  num_points: 1_024 # Number of points to sample on surface and volume per batch
+  num_points: 1_240_000 # Number of points to sample on surface and volume per batch
