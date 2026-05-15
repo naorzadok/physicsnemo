@@ -20,3 +20,8 @@ This subpackage contains experimental neural network layers and utilities
 that are under active development. These components may have breaking API
 changes between releases.
 """
+
+from .flare_attention import FLARE
+from .diffusion_unet_3d_blocks import UNetBlock3D, Conv3D, GroupNorm3D, UNetAttention3D
+
+__all__ = ["FLARE", "UNetBlock3D", "Conv3D", "GroupNorm3D", "UNetAttention3D"]

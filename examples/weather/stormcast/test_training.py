@@ -162,8 +162,9 @@ def test_training(
     if dist.world_size > 1:
         torch.distributed.barrier()
 
-    net_cls = "EDMPrecond" if net_architecture == "unet" else "EDMPreconditioner"
-    ckpt_path = os.path.join(rundir, "checkpoints_diffusion", f"{net_cls}.0.10.mdlus")
+    ckpt_path = os.path.join(
+        rundir, "checkpoints_diffusion", "EDMPreconditioner.0.10.mdlus"
+    )
     assert os.path.isfile(ckpt_path), "Diffusion checkpoint not found"
 
 
@@ -232,29 +233,41 @@ def test_checkpointing(
     if num_procs > 1:
         torch.distributed.barrier()
 
-    net_cls = "EDMPrecond" if net_architecture == "unet" else "EDMPreconditioner"
-    ckpt_path = os.path.join(rundir, "checkpoints_diffusion", f"{net_cls}.0.20.mdlus")
+    ckpt_path = os.path.join(
+        rundir, "checkpoints_diffusion", "EDMPreconditioner.0.20.mdlus"
+    )
     assert os.path.isfile(ckpt_path), (
         f"Diffusion checkpoint not found on rank {dist.rank}"
     )
 
 
+@pytest.mark.parametrize("force_sharding", [False, True])
 def test_checkpoint_integrity(
     tmp_path: Path,
     cfg_diffusion: DictConfig,
     *,
+    force_sharding: bool,
     net_architecture: Literal["unet", "dit"] = "dit",
 ):
     """Test that model and optimizer states are intact and sharded correctly after checkpoint save/load."""
 
     dist = DistributedManager()
-    if not dist.world_size == 4:
+    if dist.world_size not in (1, 4):
         pytest.skip(
-            f"Skipping: test_checkpoint_integrity is only run with exactly 4 processes, current: {dist.world_size}."
+            f"Skipping: test_checkpoint_integrity is only run with 1 or 4 processes, current: {dist.world_size}."
         )
 
-    cfg_diffusion.training.domain_parallel_size = 2
-    cfg_diffusion.training.batch_size = 2
+    if dist.world_size == 4:
+        if force_sharding:
+            pytest.skip(
+                "Skipping: force_sharding is redundant with domain_parallel_size = 2"
+            )
+        cfg_diffusion.training.domain_parallel_size = 2
+        cfg_diffusion.training.batch_size = 2
+    else:
+        cfg_diffusion.training.domain_parallel_size = 1
+        cfg_diffusion.training.batch_size = 1
+        cfg_diffusion.training.force_sharding = force_sharding
     cfg_diffusion.training.rundir = _setup_rundir(tmp_path, dist.world_size)
     cfg_diffusion.training.seed = 0
 
@@ -279,6 +292,13 @@ def test_checkpoint_integrity(
     (params0, opt_params0) = get_state_dict(net0, opt0, options=options)
     (params1, opt_params1) = get_state_dict(net1, opt1, options=options)
 
+    assert set(params0.keys()) == set(params1.keys()), (
+        "State dicts before and after checkpointing have different keys"
+    )
+    assert set(opt_params0.keys()) == set(opt_params1.keys()), (
+        "Optimizer state dicts before and after checkpointing have different keys"
+    )
+
     for key, param0 in params0.items():
         param1 = params1[key]
         assert (param0 == param1).all().cpu().item(), (
@@ -286,11 +306,50 @@ def test_checkpoint_integrity(
         )
 
     for key, opt_param0 in opt_params0["state"].items():
-        opt_param1 = opt_params0["state"][key]
+        opt_param1 = opt_params1["state"][key]
         for opt_var in opt_param0:
             assert (opt_param0[opt_var] == opt_param1[opt_var]).all().cpu().item(), (
                 f"Optimizer parameter {key} before and after checkpointing is not equal"
             )
+
+    for _ in range(5):
+        t1.train_step()
+    t1.save_checkpoint()
+
+    torch.distributed.barrier()
+
+    # flip sharding setting to test that sharded checkpoints load ok in non-sharded mode and vice versa
+    cfg_diffusion.training.force_sharding = not cfg_diffusion.training.force_sharding
+    t2 = trainer.Trainer(cfg_diffusion.copy())
+    net2 = t2.net
+    opt2 = t2.optimizer
+
+    options = StateDictOptions(full_state_dict=True)
+    (params1, opt_params1) = get_state_dict(net1, opt1, options=options)
+    (params2, opt_params2) = get_state_dict(net2, opt2, options=options)
+
+    assert set(params1.keys()) == set(params2.keys()), (
+        "Model state dicts before and after checkpointing have different keys"
+    )
+    assert set(opt_params1.keys()) == set(opt_params2.keys()), (
+        "Optimizer state dicts before and after checkpointing have different keys"
+    )
+
+    for key, param1 in params1.items():
+        param2 = params2[key]
+        assert (param1 == param2).all().cpu().item(), (
+            f"Model parameter {key} before (force_sharding={force_sharding}) and after force_sharding={not force_sharding} checkpointing is not equal"
+        )
+
+    for key, opt_param1 in opt_params1["state"].items():
+        opt_param2 = opt_params2["state"][key]
+        for opt_var in opt_param1:
+            assert (opt_param1[opt_var] == opt_param2[opt_var]).all().cpu().item(), (
+                f"Optimizer parameter {key} before (force_sharding={force_sharding}) and after force_sharding={not force_sharding} checkpointing is not equal"
+            )
+
+    if dist.world_size != 4:
+        return  # remaining tests are for the 4-GPU setup
 
     # get positional embedding tensors for model and optimizer
     posembed = params1["model.model.tokenizer.pos_embed"]
@@ -359,7 +418,7 @@ def test_seeding(
 
       - Domain (model-parallel) groups are {0, 1} and {2, 3}.
         Ranks within the same domain group must see **identical** sigma
-        (enforced by ``replicate_in_mesh`` broadcast).
+        (enforced by ``DomainParallelNoiseScheduler`` broadcast).
       - DDP (data-parallel) groups are {0, 2} and {1, 3}.
         Ranks in different DDP groups must see **different** sigma
         (they process different data and have distinct RNG seeds).
@@ -391,17 +450,26 @@ def test_seeding(
 
     t = trainer.Trainer(cfg)
 
-    # -- instrument the loss to capture post-broadcast sigma values ----------
-    captured_sigmas: list[torch.Tensor] = []
-    _orig_replicate = t.loss_fn.replicate_in_mesh
+    # -- instrument the loss to capture sigma values -------------------------
+    from physicsnemo.diffusion.noise_schedulers import DomainParallelNoiseScheduler
 
-    def _capturing_replicate(x, y):
-        result = _orig_replicate(x, y)
-        local = result.to_local() if hasattr(result, "to_local") else result
-        captured_sigmas.append(local.detach().cpu())
+    scheduler = t.train_noise_scheduler
+    if domain_parallel_size > 1 and not isinstance(
+        scheduler, DomainParallelNoiseScheduler
+    ):
+        raise ValueError(
+            "test_seeding requires a DomainParallelNoiseScheduler on the "
+            "loss when domain_parallel_size > 1"
+        )
+    captured_sigmas: list[torch.Tensor] = []
+    _orig_sample_time = scheduler.sample_time
+
+    def _capturing_sample_time(*args, **kwargs):
+        result = _orig_sample_time(*args, **kwargs)
+        captured_sigmas.append(result.detach().cpu())
         return result
 
-    t.loss_fn.replicate_in_mesh = _capturing_replicate
+    scheduler.sample_time = _capturing_sample_time
 
     # -- helper: gather sigmas and assert the expected pattern ---------------
     def _check_sigma_pattern(label: str) -> None:
@@ -520,8 +588,7 @@ def test_model_types(
         if dist.world_size > 1:
             torch.distributed.barrier()
 
-        net_cls = "EDMPrecond" if net_architecture == "unet" else "EDMPreconditioner"
         ckpt_path = os.path.join(
-            rundir, "checkpoints_diffusion", f"{net_cls}.0.10.mdlus"
+            rundir, "checkpoints_diffusion", "EDMPreconditioner.0.10.mdlus"
         )
         assert os.path.isfile(ckpt_path), "Diffusion checkpoint not found"

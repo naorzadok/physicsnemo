@@ -7,12 +7,6 @@ editable-install:
 	pip install --upgrade pip && \
 		pip install -e .[dev] --config-settings editable_mode=strict
 
-get-data:
-	test -n "$(TEST_DATA_DIR)" || { echo "Error: TEST_DATA_DIR should be set"; exit 1; }
-	mkdir -p $(TEST_DATA_DIR) && \
-	rm -rf $(TEST_DATA_DIR)/modulus-data && \
-	git clone https://gitlab-master.nvidia.com/modulus/modulus-data.git $(TEST_DATA_DIR)/modulus-data && \
-	echo "Test data has been saved in ${TEST_DATA_DIR}"
 
 setup-ci:
 	pip install pre-commit && \
@@ -48,10 +42,9 @@ pytest-internal:
 		pytest && \
 		cd ../../
 
-# NOTE: temporarily omitting diffusion coverage until we have a better way to test it.
 coverage:
 	coverage combine && \
-		coverage report --show-missing --omit=*test* --omit=*internal* --omit=*experimental* --omit=*diffusion* --fail-under=60 && \
+		coverage report --show-missing --omit=*test* --omit=*internal* --omit=*experimental* --fail-under=60 && \
 		coverage html
 
 all-ci: get-data setup-ci black interrogate lint license install pytest doctest coverage

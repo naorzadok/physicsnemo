@@ -29,16 +29,18 @@ from einops import rearrange
 from jaxtyping import Float
 
 import physicsnemo  # noqa: F401 for docs
-from physicsnemo.core.version_check import check_version_spec
+from physicsnemo.core.version_check import check_version_spec, OptionalImport
 from physicsnemo.nn import Mlp
 from physicsnemo.nn.module.physics_attention import (
     PhysicsAttentionIrregularMesh,
 )
 
+from physicsnemo.experimental.models.geotransolver.gale_fa import GALE_FA
+from physicsnemo.nn import ConcreteDropout
+
 # Check optional dependency availability
 TE_AVAILABLE = check_version_spec("transformer_engine", "0.1.0", hard_fail=False)
-if TE_AVAILABLE:
-    import transformer_engine.pytorch as te
+te = OptionalImport("transformer_engine.pytorch", "0.1.0")
 
 
 class GALE(PhysicsAttentionIrregularMesh):
@@ -67,6 +69,11 @@ class GALE(PhysicsAttentionIrregularMesh):
         Whether to use Transolver++ features. Default is False.
     context_dim : int, optional
         Dimension of the context vector for cross-attention. Default is 0.
+    state_mixing_mode : str, optional
+        How to blend self-attention and cross-attention outputs.         ``"weighted"`` uses
+        a learnable sigmoid-gated weighted sum. ``"concat_project"``
+        concatenates the two along the head dimension and projects back with a
+        linear layer. Default is ``"weighted"``.
 
     Forward
     -------
@@ -118,8 +125,17 @@ class GALE(PhysicsAttentionIrregularMesh):
         use_te: bool = True,
         plus: bool = False,
         context_dim: int = 0,
+        concrete_dropout: bool = False,
+        state_mixing_mode: str = "weighted",
     ) -> None:
         super().__init__(dim, heads, dim_head, dropout, slice_num, use_te, plus)
+
+        if state_mixing_mode not in ("weighted", "concat_project"):
+            raise ValueError(
+                f"Invalid state_mixing_mode: {state_mixing_mode!r}. "
+                f"Expected 'weighted' or 'concat_project'."
+            )
+        self.state_mixing_mode = state_mixing_mode
 
         linear_layer = te.Linear if self.use_te else nn.Linear
 
@@ -128,9 +144,24 @@ class GALE(PhysicsAttentionIrregularMesh):
         self.cross_k = linear_layer(context_dim, dim_head)
         self.cross_v = linear_layer(context_dim, dim_head)
 
-        # Learnable mixing weight between self and cross attention
-        # Initialize near 0.0 since sigmoid(0) = 0.5, giving balanced initial mixing
-        self.state_mixing = nn.Parameter(torch.tensor(0.0))
+        # Mixing layers for blending self-attention and cross-attention
+        if state_mixing_mode == "weighted":
+            # Learnable mixing weight between self and cross attention
+            # Initialize near 0.0 since sigmoid(0) = 0.5, giving balanced initial mixing
+            self.state_mixing = nn.Parameter(torch.tensor(0.0))
+        else:
+            # Concatenate self and cross attention and project back to dim_head
+            self.concat_project = nn.Sequential(
+                linear_layer(2 * dim_head, dim_head),
+                nn.GELU(),
+            )
+
+        # Replace inherited out_dropout with ConcreteDropout when enabled
+        if concrete_dropout:
+            self.out_dropout = ConcreteDropout(
+                in_features=dim,
+                init_p=max(dropout, 0.05),
+            )
 
     def compute_slice_attention_cross(
         self,
@@ -267,12 +298,18 @@ class GALE(PhysicsAttentionIrregularMesh):
                 for _slice_token in slice_tokens
             ]
 
-            # Blend self-attention and cross-attention with learnable mixing weight
-            mixing_weight = torch.sigmoid(self.state_mixing)
-            out_slice_token = [
-                mixing_weight * sst + (1 - mixing_weight) * cst
-                for sst, cst in zip(self_slice_token, cross_slice_token)
-            ]
+            # Blend self-attention and cross-attention
+            if self.state_mixing_mode == "weighted":
+                mixing_weight = torch.sigmoid(self.state_mixing)
+                out_slice_token = [
+                    mixing_weight * sst + (1 - mixing_weight) * cst
+                    for sst, cst in zip(self_slice_token, cross_slice_token)
+                ]
+            else:
+                out_slice_token = [
+                    self.concat_project(torch.cat([sst, cst], dim=-1))
+                    for sst, cst in zip(self_slice_token, cross_slice_token)
+                ]
         else:
             # Use only self-attention when no context is provided
             out_slice_token = self_slice_token
@@ -317,6 +354,14 @@ class GALE_block(nn.Module):
         Whether to use Transolver++ features. Default is ``False``.
     context_dim : int, optional
         Dimension of the context vector for cross-attention. Default is 0.
+    attention_type : str, optional
+        attention_type is used to choose the attention type (GALE or GALE_FA). 
+        Default is ``"GALE"``.
+    state_mixing_mode : str, optional
+        How to blend self-attention and cross-attention outputs.         ``"weighted"`` uses
+        a learnable sigmoid-gated weighted sum. ``"concat_project"``
+        concatenates the two along the head dimension and projects back with a
+        linear layer. Default is ``"weighted"``.
 
     Forward
     -------
@@ -369,6 +414,9 @@ class GALE_block(nn.Module):
         use_te: bool = True,
         plus: bool = False,
         context_dim: int = 0,
+        attention_type: str = "GALE",
+        concrete_dropout: bool = False,
+        state_mixing_mode: str = "weighted",
     ) -> None:
         super().__init__()
 
@@ -386,17 +434,38 @@ class GALE_block(nn.Module):
         else:
             self.ln_1 = nn.LayerNorm(hidden_dim)
 
-        # GALE attention layer
-        self.Attn = GALE(
-            hidden_dim,
-            heads=num_heads,
-            dim_head=hidden_dim // num_heads,
-            dropout=dropout,
-            slice_num=slice_num,
-            use_te=use_te,
-            plus=plus,
-            context_dim=context_dim,
-        )
+        # Attention layer
+        match attention_type:
+            case 'GALE':
+                self.Attn = GALE(
+                    hidden_dim,
+                    heads=num_heads,
+                    dim_head=hidden_dim // num_heads,
+                    dropout=dropout,
+                    slice_num=slice_num,
+                    use_te=use_te,
+                    plus=plus,
+                    context_dim=context_dim,
+                    concrete_dropout=concrete_dropout,
+                    state_mixing_mode=state_mixing_mode,
+                )
+            case 'GALE_FA':
+                self.Attn = GALE_FA(
+                    hidden_dim,
+                    heads=num_heads,
+                    dim_head=hidden_dim // num_heads,
+                    dropout=dropout,
+                    n_global_queries=slice_num,
+                    use_te=use_te,
+                    context_dim=context_dim,
+                    concrete_dropout=concrete_dropout,
+                    state_mixing_mode=state_mixing_mode,
+                )
+            case _:
+                raise ValueError(
+                    f"Invalid attention type: {attention_type}. "
+                    f"Expected 'GALE' or 'GALE_FA'."
+                )
 
         # Feed-forward network with layer normalization
         if use_te:
@@ -415,6 +484,20 @@ class GALE_block(nn.Module):
                     use_te=False,
                 ),
             )
+
+        # Concrete dropout after attention and FFN residuals
+        if concrete_dropout:
+            self.attn_dropout = ConcreteDropout(
+                in_features=hidden_dim,
+                init_p=max(dropout, 0.05),
+            )
+            self.ffn_dropout = ConcreteDropout(
+                in_features=hidden_dim,
+                init_p=max(dropout, 0.05),
+            )
+        else:
+            self.attn_dropout = None
+            self.ffn_dropout = None
 
     def forward(
         self,
@@ -459,7 +542,15 @@ class GALE_block(nn.Module):
         # Residual connection after attention
         fx_out = [attn[i] + fx[i] for i in range(len(fx))]
 
+        # Concrete dropout after attention residual
+        if self.attn_dropout is not None:
+            fx_out = [self.attn_dropout(_fx) for _fx in fx_out]
+
         # Feed-forward network with residual connection
         fx_out = [self.ln_mlp1(_fx) + _fx for _fx in fx_out]
+
+        # Concrete dropout after FFN residual
+        if self.ffn_dropout is not None:
+            fx_out = [self.ffn_dropout(_fx) for _fx in fx_out]
 
         return fx_out

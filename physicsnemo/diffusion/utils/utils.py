@@ -14,10 +14,85 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Sequence, TypeVar
 
 import numpy as np
 import torch
+from jaxtyping import Float
+from torch import Tensor
+
+_T = TypeVar("_T")
+
+
+def _unwrap_module(model: torch.nn.Module, target_cls: type[_T]) -> _T:
+    """Peel off DDP / torch.compile wrappers to reach the underlying module.
+
+    The unwrapping order handles arbitrary nesting of
+    ``DistributedDataParallel`` (``model.module``) and ``torch.compile``
+    (``OptimizedModule._orig_mod``).
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Possibly-wrapped module to unwrap.
+    target_cls : type
+        The class to unwrap to.
+
+    Returns
+    -------
+    module : target_cls
+        The unwrapped module.
+
+    Raises
+    ------
+    TypeError
+        If ``target_cls`` is not found before reaching a leaf module.
+    """
+    m: Any = model
+    while not isinstance(m, target_cls):
+        if isinstance(m, torch._dynamo.eval_frame.OptimizedModule):
+            m = m._orig_mod
+        elif hasattr(m, "module"):
+            m = m.module
+        else:
+            raise TypeError(
+                f"Could not unwrap a {target_cls.__name__} from "
+                f"{type(model).__name__}. Found leaf type "
+                f"{type(m).__name__}."
+            )
+    return m
+
+
+def apply_loss_weight(
+    w: Float[Tensor, " N"] | Float[Tensor, " N C"],
+    data_ndim: int,
+) -> Tensor:
+    """Reshape a loss weight tensor for broadcasting with per-element loss.
+
+    Handles both scalar weights of shape ``(N,)`` and per-channel weights of
+    shape ``(N, C)`` produced by schedulers with per-channel ``sigma_data``.
+    Trailing spatial dimensions are padded with size-1 so that the result
+    broadcasts correctly against loss tensors of shape ``(B, C, ...)``.
+
+    The output shape depends on the input:
+
+    - ``(N,)``    -> ``(N, 1, ..., 1)``  with ``data_ndim - 1`` trailing ones
+    - ``(N, C)``  -> ``(N, C, 1, ..., 1)`` with ``data_ndim - 2`` trailing ones
+
+    Parameters
+    ----------
+    w : Tensor
+        Loss weight tensor of shape :math:`(N,)` or :math:`(N, C)`.
+    data_ndim : int
+        Number of dimensions in the data tensor (e.g. 4 for ``(B, C, H, W)``).
+
+    Returns
+    -------
+    Tensor
+        Reshaped weight tensor with trailing size-1 dimensions appended so
+        that ``w.ndim == data_ndim``.
+    """
+    return w.reshape(*w.shape, *([1] * (data_ndim - w.ndim)))
 
 
 class StackedRandomGenerator:
