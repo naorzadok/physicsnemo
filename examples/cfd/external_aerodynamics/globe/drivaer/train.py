@@ -51,7 +51,7 @@ from mlflow.tracking.fluent import (
     start_run,
 )
 from tensordict import TensorDict
-from torch.distributed import ReduceOp, all_reduce, barrier
+from torch.distributed import barrier
 from torch.profiler import record_function
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -62,7 +62,7 @@ from utilities import (
 )
 
 from physicsnemo.core import get_physicsnemo_pkg_info
-from physicsnemo.distributed import DistributedManager
+from physicsnemo.distributed import DistributedManager, fused_all_reduce
 from physicsnemo.experimental.models.globe.model import GLOBE
 from physicsnemo.experimental.utils import (
     disable_autotune_printing,
@@ -111,6 +111,7 @@ def main(
     n_spherical_harmonics: int = 4,
     theta: float = 1.0,
     leaf_size: int = 1,
+    tree_build_device: Literal["cpu", "cuda"] | None = None,
     n_faces_per_boundary: int = 80_000,
     patience_steps: int = 1600,
     use_profiler: bool = True,
@@ -152,6 +153,8 @@ def main(
         theta: Barnes-Hut opening angle. Larger values are more
             aggressive (more approximation, faster). 0 = exact.
         leaf_size: Maximum sources per leaf node in the Barnes-Hut tree.
+        tree_build_device: Device on which to build cluster trees and run the
+            dual-tree Barnes-Hut traversal. ``None`` (default) uses the input's device.
         n_faces_per_boundary: Target boundary mesh face count after decimation.
         patience_steps: ReduceLROnPlateau patience expressed in gradient
             steps (world-size independent).  Converted to epochs internally.
@@ -281,6 +284,7 @@ def main(
         self_regularization_beta=self_regularization_beta,
         latent_compression_scale=latent_compression_scale,
         expand_far_targets=expand_far_targets,
+        tree_build_device=tree_build_device,
     ).to(device)
 
     logger0.info(f"{output_dir.name=!r}")
@@ -358,8 +362,6 @@ def main(
         min_lr=learning_rate / 64,
         threshold=1e-3,
     )
-    scaler = torch.amp.GradScaler(device=device.type, enabled=amp)
-
     ### [Checkpoint Save/Load]
     metadata_dict: dict[str, Any] = {}
     epoch = load_checkpoint(
@@ -367,7 +369,6 @@ def main(
         models=base_model,
         optimizer=optimizer,
         scheduler=scheduler,
-        scaler=scaler,
         metadata_dict=metadata_dict,
         device=dist.device,
     )
@@ -438,7 +439,6 @@ def main(
                 **config_settings,
                 "optimizer": optimizer.__class__.__name__,
                 "scheduler": scheduler.__class__.__name__,
-                "scaler": scaler.__class__.__name__,
                 "physicsnemo_pkg_info": get_physicsnemo_pkg_info(),
                 "world_size": dist.world_size,
                 **{f"n_{split}_samples": len(sample_paths[split]) for split in splits},
@@ -466,7 +466,9 @@ def main(
         batch_loss = batch_loss_components.stack_from_tensordict().sum()
         return batch_loss, batch_loss_components
 
-    def run_epoch(split: Split) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def run_epoch(
+        split: Split,
+    ) -> tuple[torch.Tensor, TensorDict[str, Float[torch.Tensor, ""]]]:
         """Run one epoch of training or testing."""
         training = split == "train"
         dataloaders[split].sampler.set_epoch(epoch=epoch)
@@ -505,15 +507,13 @@ def main(
                     if torch.isnan(batch_loss):
                         warnings.warn(f"{batch_loss=} at: {dist.rank=}, {epoch=}")
                     with record_function("backward"):
-                        scaler.scale(batch_loss).backward()
+                        batch_loss.backward()
                     if gradient_clip_norm is not None:
-                        scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(
                             model.parameters(), max_norm=gradient_clip_norm
                         )
                     with record_function("optimizer_step"):
-                        scaler.step(optimizer)
-                        scaler.update()
+                        optimizer.step()
 
                 all_batch_losses.append(batch_loss.detach().clone())
                 for k, v in batch_loss_components.items():
@@ -530,20 +530,27 @@ def main(
                 torch._logging.set_logs(graph_breaks=False, recompiles=False)
 
         ### [Distributed comms]
-        keys = ["loss", *all_batch_loss_components.keys()]
-        all_values = torch.stack(
-            [
-                torch.nanmean(torch.stack(all_batch_losses)),
-                *(
-                    torch.nanmean(torch.stack(all_batch_loss_components[k]))
-                    for k in keys[1:]
-                ),
-            ]
+        # Reduce per-key NaN-aware sums and non-NaN counts in one collective,
+        # then divide for a sample-weighted global mean. Deliberately sum/count
+        # (not AVG like the sibling recipes) to stay NaN-robust: an all-NaN rank
+        # adds 0 to both sum and count and drops out instead of poisoning the
+        # mean; the count is a small, exact non-NaN tally, never a large integer.
+        # The scalar epoch loss sits in its own "loss" slot, kept separate from
+        # the per-component "components" sub-tree so the two can never collide.
+        batches = TensorDict(
+            {
+                "loss": torch.stack(all_batch_losses),
+                "components": {
+                    k: torch.stack(v) for k, v in all_batch_loss_components.items()
+                },
+            }
         )
-        if dist.world_size > 1:
-            all_reduce(all_values, op=ReduceOp.AVG)
-        epoch_loss = all_values[0]
-        epoch_loss_components = dict(zip(keys[1:], all_values[1:]))
+        sums = batches.apply(torch.nansum)
+        counts = batches.apply(lambda v: (~torch.isnan(v)).sum().to(v.dtype))
+        reduced = fused_all_reduce(TensorDict({"sums": sums, "counts": counts}))
+        means = reduced["sums"] / reduced["counts"]
+        epoch_loss = means["loss"]
+        epoch_loss_components = means["components"]
 
         logger0.info(
             " | ".join(
@@ -594,7 +601,6 @@ def main(
                 models=base_model,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                scaler=scaler,
                 epoch=epoch,
                 metadata=checkpoint_metadata(),
             )

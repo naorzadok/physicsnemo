@@ -31,10 +31,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 
 from datasets import (
     ManifestSampler,
+    _build_manifest_val_dataset,
+    build_dataset,
     load_manifest,
     resolve_manifest_indices,
     resolve_manifest_spec,
@@ -256,67 +258,45 @@ class TestValidateDatasetConsistency:
         return (
             {"pressure": "scalar", "wss": "vector"},
             ["l1", "l2", "mae"],
-            {"U_inf": [30.0, 0.0, 0.0]},
         )
 
-    def test_matching_metadata_targets_metrics_is_silent(self, caplog):
+    def test_matching_targets_metrics_is_silent(self, caplog):
         """All-equal blocks: no raise, no warning."""
-        first_targets, first_metrics, first_metadata = self._first()
+        first_targets, first_metrics = self._first()
         with caplog.at_level(logging.WARNING):
             validate_dataset_consistency(
                 ds_key="ds_b",
                 ds_targets=dict(first_targets),
                 ds_metrics=list(first_metrics),
-                ds_metadata=dict(first_metadata),
                 first_targets=first_targets,
                 first_metrics=first_metrics,
-                first_metadata=first_metadata,
             )
         assert caplog.records == []
 
     def test_targets_mismatch_raises(self):
         """Targets mismatch is the loss-correctness contract -- must raise."""
-        first_targets, first_metrics, first_metadata = self._first()
+        first_targets, first_metrics = self._first()
         with pytest.raises(ValueError, match="does not match the first dataset"):
             validate_dataset_consistency(
                 ds_key="ds_b",
                 ds_targets={"pressure": "scalar"},  # missing wss
                 ds_metrics=list(first_metrics),
-                ds_metadata=dict(first_metadata),
                 first_targets=first_targets,
                 first_metrics=first_metrics,
-                first_metadata=first_metadata,
             )
 
     def test_metrics_mismatch_warns(self, caplog):
         """Metrics mismatch is a soft drift -- warns, doesn't raise."""
-        first_targets, first_metrics, first_metadata = self._first()
-        with caplog.at_level(logging.WARNING, logger="training.build_dataloaders"):
+        first_targets, first_metrics = self._first()
+        with caplog.at_level(logging.WARNING, logger="training.datasets"):
             validate_dataset_consistency(
                 ds_key="ds_b",
                 ds_targets=dict(first_targets),
                 ds_metrics=["l2"],  # softer
-                ds_metadata=dict(first_metadata),
                 first_targets=first_targets,
                 first_metrics=first_metrics,
-                first_metadata=first_metadata,
             )
         assert any("metrics=" in r.message for r in caplog.records)
-
-    def test_metadata_mismatch_warns(self, caplog):
-        """Metadata mismatch is a soft drift -- warns, doesn't raise."""
-        first_targets, first_metrics, first_metadata = self._first()
-        with caplog.at_level(logging.WARNING, logger="training.build_dataloaders"):
-            validate_dataset_consistency(
-                ds_key="ds_b",
-                ds_targets=dict(first_targets),
-                ds_metrics=list(first_metrics),
-                ds_metadata={"U_inf": [25.0, 0.0, 0.0]},
-                first_targets=first_targets,
-                first_metrics=first_metrics,
-                first_metadata=first_metadata,
-            )
-        assert any("metadata" in r.message for r in caplog.records)
 
 
 ### ---------------------------------------------------------------------------
@@ -383,12 +363,121 @@ class TestResolveManifestSpec:
         assert spec["manifest"] == str(derived)
         assert spec["train_split"] == "train"
 
-    def test_style_b_split_alone_without_derivable_manifest_returns_none(
+    def test_style_b_split_alone_without_derivable_manifest_raises(
         self, tmp_path: Path
     ):
-        """Split key with no manifest path AND no sibling file -> directory mode."""
+        """Split key with no manifest path AND no sibling file -> raise.
+
+        The user clearly intended manifest mode (they set ``train_split``);
+        silently falling back to directory mode used to make the val loader
+        iterate the train data when the dataset YAML had no ``val_datadir``,
+        so we now fail loud at config-resolution time instead.
+        """
         ds_yaml = OmegaConf.create({"train_datadir": str(tmp_path)})
         ds_block = OmegaConf.create({"train_split": "train"})
-        ### tmp_path has no manifest.json sibling -> can't derive -> falls
-        ### back to directory mode (returns None).
+        with pytest.raises(ValueError, match="Manifest mode was requested"):
+            resolve_manifest_spec(ds_yaml, ds_block)
+
+    def test_val_split_alone_without_manifest_raises(self, tmp_path: Path):
+        """A bare ``val_split`` is also a clear manifest-mode signal."""
+        ds_yaml = OmegaConf.create({"train_datadir": str(tmp_path)})
+        ds_block = OmegaConf.create({"val_split": "val"})
+        with pytest.raises(ValueError, match="Manifest mode was requested"):
+            resolve_manifest_spec(ds_yaml, ds_block)
+
+    def test_directory_mode_unaffected_by_loud_failure(self, tmp_path: Path):
+        """A fully-unset block remains valid directory mode (returns None)."""
+        ds_yaml = OmegaConf.create({"train_datadir": str(tmp_path)})
+        ds_block = OmegaConf.create({})
         assert resolve_manifest_spec(ds_yaml, ds_block) is None
+
+
+### ---------------------------------------------------------------------------
+### _build_manifest_val_dataset
+### ---------------------------------------------------------------------------
+
+
+class TestManifestValDataset:
+    """Tests for :func:`datasets._build_manifest_val_dataset`.
+
+    Manifest mode shares one reader across the train / val splits, so
+    validation must not inherit the train augmentations. This mirrors
+    directory mode, which always builds its val dataset with
+    ``augment=False`` -- the asymmetry these tests lock down.
+    """
+
+    @staticmethod
+    def _augmented_ds_yaml(datadir: Path) -> DictConfig:
+        """Minimal manifest-style volume dataset YAML carrying augmentations.
+
+        Trimmed to what the dataset builder inspects: the reader globs
+        paths lazily (no file is opened at construction), so the directory
+        only needs placeholder files, and the transform chain just needs a
+        ``CenterMesh`` anchor plus the augmentations that get inserted
+        after it.
+        """
+        return OmegaConf.create(
+            {
+                "pipeline": {
+                    "reader": {
+                        "_target_": "${dp:DomainMeshReader}",
+                        "path": str(datadir),
+                        "pattern": "run_*/domain_*.pdmsh",
+                    },
+                    "augmentations": [
+                        {"_target_": "${dp:RandomRotateMesh}", "axes": ["z"]},
+                        {"_target_": "${dp:RandomTranslateMesh}"},
+                    ],
+                    "transforms": [
+                        {"_target_": "${dp:CenterMesh}"},
+                    ],
+                },
+                "targets": {"pressure": "scalar"},
+            }
+        )
+
+    @staticmethod
+    def _make_datadir(tmp_path: Path) -> Path:
+        """Create placeholder runs the reader can glob (it never opens them)."""
+        for i in range(2):
+            run = tmp_path / f"run_{i}"
+            run.mkdir()
+            (run / f"domain_{i}.pdmsh").write_bytes(b"")
+        return tmp_path
+
+    def test_augment_off_returns_none(self, tmp_path: Path):
+        """``augment=False`` -> val shares the train dataset (None sentinel)."""
+        ds_yaml = self._augmented_ds_yaml(self._make_datadir(tmp_path))
+        assert (
+            _build_manifest_val_dataset(
+                ds_yaml,
+                augment=False,
+                device=None,
+                num_workers=1,
+                pin_memory=False,
+            )
+            is None
+        )
+
+    def test_augment_on_returns_unaugmented_dataset(self, tmp_path: Path):
+        """``augment=True`` -> a separate dataset whose chain has no augmentations."""
+        ds_yaml = self._augmented_ds_yaml(self._make_datadir(tmp_path))
+
+        ### Guard against a vacuous assertion: the train dataset must
+        ### actually carry a stochastic augmentation for the val check to
+        ### mean anything.
+        train_ds = build_dataset(
+            ds_yaml, augment=True, device=None, num_workers=1, pin_memory=False
+        )
+        assert any(getattr(t, "stochastic", False) for t in train_ds.transforms)
+
+        val_ds = _build_manifest_val_dataset(
+            ds_yaml, augment=True, device=None, num_workers=1, pin_memory=False
+        )
+        assert val_ds is not None
+        ### A distinct object (own reader), not the train dataset.
+        assert val_ds is not train_ds
+        ### No stochastic (augmentation) transforms survive on the val chain.
+        assert not any(getattr(t, "stochastic", False) for t in val_ds.transforms)
+        ### ...but the deterministic CenterMesh transform is still present.
+        assert any(type(t).__name__ == "CenterMesh" for t in val_ds.transforms)

@@ -31,8 +31,10 @@ from .equivariant_ops import (
 )
 from .fourier_spectral import imag, irfft, irfft2, real, rfft, rfft2, view_as_complex
 from .geometry import (
+    farthest_point_sampling,
     mesh_poisson_disk_sample,
     mesh_to_voxel_fraction,
+    ray_mesh_intersect,
     signed_distance_field,
 )
 from .interpolation import (
@@ -43,17 +45,31 @@ from .interpolation import (
 from .natten import na1d, na2d, na3d
 from .neighbors import knn, radius_search
 from .regularization_parameterization import drop_path, weight_fact
+from .rendering import (
+    isosurface_render,
+    line_integral_convolution,
+    mesh_raycast,
+    point_cloud_render,
+    scalar_field_to_rgba,
+    vector_field_to_rgba,
+    volume_render,
+    wireframe_render,
+)
 
 __all__ = [
     "irfft",
     "irfft2",
     "drop_path",
+    "farthest_point_sampling",
     "grid_to_point_interpolation",
     "imag",
     "interpolation",
     "knn",
+    "isosurface_render",
     "legendre_polynomials",
+    "line_integral_convolution",
     "mesh_green_gauss_gradient",
+    "mesh_raycast",
     "meshless_fd_derivatives",
     "mesh_lsq_gradient",
     "mesh_poisson_disk_sample",
@@ -65,15 +81,21 @@ __all__ = [
     "polar_and_dipole_basis",
     "radius_search",
     "real",
+    "ray_mesh_intersect",
     "rectilinear_grid_gradient",
     "rfft",
     "rfft2",
+    "point_cloud_render",
+    "scalar_field_to_rgba",
     "signed_distance_field",
     "smooth_log",
     "spectral_grid_gradient",
     "spherical_basis",
     "uniform_grid_gradient",
+    "vector_field_to_rgba",
     "vector_project",
+    "volume_render",
     "view_as_complex",
     "weight_fact",
+    "wireframe_render",
 ]
