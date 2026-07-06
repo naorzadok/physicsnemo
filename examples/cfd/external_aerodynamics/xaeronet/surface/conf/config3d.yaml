@@ -37,6 +37,7 @@ sampling:                                            # Boundary point sampling s
   curvature_weight: 4.0                              # lambda: strength of curvature bias (higher -> denser at features)
   curvature_exponent: 1.0                            # exponent applied to normalized curvature before weighting
   curvature_clip_percentile: 95.0                    # clip curvature at this percentile to avoid a few spikes dominating
+  curvature_smoothing_iterations: 5                  # neighbor-averaging passes to denoise per-vertex curvature (0 disables)
   min_weight: 0.3                                    # floor on the per-cell weight so smooth regions are not starved
 
 # ┌───────────────────────────────────────────┐

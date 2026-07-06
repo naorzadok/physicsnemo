@@ -52,13 +52,56 @@ def load_stl_mesh(stl_file):
     return pv.read(stl_file)
 
 
+def _smooth_point_scalar(pv_mesh, values, iterations):
+    """Denoise a per-vertex scalar field with umbrella (neighbor-average) passes.
+
+    STL surfaces are faceted, so raw per-vertex curvature is noisy. Each pass
+    replaces a vertex value by the mean of its topological neighbors, which
+    smooths the field without moving the geometry.
+
+    Parameters
+    ----------
+    pv_mesh : pyvista.PolyData
+        Triangulated surface mesh.
+    values : np.ndarray
+        Per-vertex scalar field of shape ``(n_points,)``.
+    iterations : int
+        Number of smoothing passes. ``0`` returns the input unchanged.
+
+    Returns
+    -------
+    np.ndarray
+        Smoothed per-vertex scalar field.
+    """
+    if iterations <= 0:
+        return values
+
+    faces = pv_mesh.regular_faces  # (n_cells, 3)
+    edges = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    n_points = pv_mesh.n_points
+
+    smoothed = values.astype(np.float64, copy=True)
+    for _ in range(iterations):
+        summed = np.zeros(n_points, dtype=np.float64)
+        counts = np.zeros(n_points, dtype=np.float64)
+        np.add.at(summed, edges[:, 0], smoothed[edges[:, 1]])
+        np.add.at(summed, edges[:, 1], smoothed[edges[:, 0]])
+        np.add.at(counts, edges[:, 0], 1.0)
+        np.add.at(counts, edges[:, 1], 1.0)
+        has_neighbors = counts > 0
+        smoothed[has_neighbors] = summed[has_neighbors] / counts[has_neighbors]
+
+    return smoothed
+
+
 def compute_cell_curvature_weights(pv_mesh, sampling_cfg):
     """Compute a per-cell importance weight from surface curvature.
 
     Uses the maximum principal curvature magnitude as a geometry-only proxy for
     regions where CFD gradients are likely to be strong (leading/trailing edges,
-    fillets, mirrors, A-pillars, etc.). The point-based curvature is averaged
-    onto each triangle and mapped to a bounded weight.
+    fillets, mirrors, A-pillars, etc.). The point-based curvature is optionally
+    smoothed to suppress STL faceting noise, then averaged onto each triangle and
+    mapped to a bounded weight.
 
     Parameters
     ----------
@@ -66,7 +109,8 @@ def compute_cell_curvature_weights(pv_mesh, sampling_cfg):
         Triangulated surface mesh.
     sampling_cfg : Mapping
         Sampling configuration with ``curvature_weight`` (lambda),
-        ``curvature_exponent``, ``curvature_clip_percentile`` and ``min_weight``.
+        ``curvature_exponent``, ``curvature_clip_percentile``,
+        ``curvature_smoothing_iterations`` and ``min_weight``.
 
     Returns
     -------
@@ -76,10 +120,16 @@ def compute_cell_curvature_weights(pv_mesh, sampling_cfg):
     lam = float(sampling_cfg.get("curvature_weight", 4.0))
     exponent = float(sampling_cfg.get("curvature_exponent", 1.0))
     clip_percentile = float(sampling_cfg.get("curvature_clip_percentile", 95.0))
+    smoothing_iterations = int(sampling_cfg.get("curvature_smoothing_iterations", 0))
     min_weight = float(sampling_cfg.get("min_weight", 0.3))
 
     # Point-based maximum principal curvature magnitude.
     point_curvature = np.abs(pv_mesh.curvature(curv_type="maximum"))
+
+    # Denoise the faceting-induced curvature spikes before mapping to cells.
+    point_curvature = _smooth_point_scalar(
+        pv_mesh, point_curvature, smoothing_iterations
+    )
 
     # Average the vertex curvature onto each triangular cell.
     faces = pv_mesh.regular_faces  # (n_cells, 3) for a triangulated surface
