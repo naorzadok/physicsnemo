@@ -196,8 +196,9 @@ def compute_cell_sampling_weights(pv_mesh, sampling_cfg):
     """Combine curvature and feature-edge importance into a per-cell weight.
 
     The weight multiplies the area-based draw probability. It starts from a base
-    of ``1`` (pure area weighting) and adds curvature and feature-edge terms,
-    then applies a floor so smooth regions are never fully starved.
+    of ``1`` (pure area weighting) and adds curvature and feature-edge terms, is
+    raised to ``density_exponent`` to control the size-field contrast, then has a
+    floor applied so smooth regions are never fully starved.
 
     Parameters
     ----------
@@ -214,6 +215,7 @@ def compute_cell_sampling_weights(pv_mesh, sampling_cfg):
     lam_curv = float(sampling_cfg.get("curvature_weight", 4.0))
     exponent = float(sampling_cfg.get("curvature_exponent", 1.0))
     lam_edge = float(sampling_cfg.get("feature_edge_weight", 0.0))
+    density_exponent = float(sampling_cfg.get("density_exponent", 1.0))
     min_weight = float(sampling_cfg.get("min_weight", 0.3))
 
     weights = np.ones(pv_mesh.n_cells)
@@ -225,6 +227,10 @@ def compute_cell_sampling_weights(pv_mesh, sampling_cfg):
     if lam_edge > 0:
         edge_importance = compute_cell_edge_weights(pv_mesh, sampling_cfg)
         weights = weights + lam_edge * edge_importance
+
+    # Size-field contrast: sampling density scales as weight ** density_exponent.
+    if density_exponent != 1.0:
+        weights = weights**density_exponent
 
     return np.maximum(min_weight, weights)
 

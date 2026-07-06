@@ -41,6 +41,7 @@ sampling:                                            # Boundary point sampling s
   feature_edge_weight: 2.0                            # strength of the feature-edge proximity bias (0 disables)
   feature_edge_angle: 30.0                            # dihedral angle (deg) above which an edge is treated as a sharp feature
   feature_edge_falloff: 0.02                          # proximity falloff length as a fraction of the mesh bounding-box diagonal
+  density_exponent: 1.0                               # size-field contrast: sampling density scales as weight^p (>1 sharpens, <1 flattens)
   min_weight: 0.3                                    # floor on the per-cell weight so smooth regions are not starved
 
 # ┌───────────────────────────────────────────┐
