@@ -32,6 +32,13 @@ data_path: /drivaer_data       # Path to the raw data
 num_preprocess_workers: 8                           # Number of workers for data preprocessing
 save_point_clouds: false                             # Save point clouds for the preprocessed data
 
+sampling:                                            # Boundary point sampling strategy
+  strategy: area                                     # "area" (uniform per unit area) or "curvature" (denser in high-curvature regions)
+  curvature_weight: 4.0                              # lambda: strength of curvature bias (higher -> denser at features)
+  curvature_exponent: 1.0                            # exponent applied to normalized curvature before weighting
+  curvature_clip_percentile: 95.0                    # clip curvature at this percentile to avoid a few spikes dominating
+  min_weight: 0.3                                    # floor on the per-cell weight so smooth regions are not starved
+
 # ┌───────────────────────────────────────────┐
 # │           Model Configuration             │
 # └───────────────────────────────────────────┘

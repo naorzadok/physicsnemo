@@ -40,7 +40,7 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
 from sklearn.neighbors import NearestNeighbors
 from hydra.utils import to_absolute_path
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from physicsnemo.datapipes.cae.readers import read_vtp
 from physicsnemo.mesh.io import from_pyvista
@@ -52,8 +52,64 @@ def load_stl_mesh(stl_file):
     return pv.read(stl_file)
 
 
-def sample_boundary_from_mesh(pv_mesh, num_points):
-    """Area-weighted sampling on a triangulated surface using physicsnemo.mesh.
+def compute_cell_curvature_weights(pv_mesh, sampling_cfg):
+    """Compute a per-cell importance weight from surface curvature.
+
+    Uses the maximum principal curvature magnitude as a geometry-only proxy for
+    regions where CFD gradients are likely to be strong (leading/trailing edges,
+    fillets, mirrors, A-pillars, etc.). The point-based curvature is averaged
+    onto each triangle and mapped to a bounded weight.
+
+    Parameters
+    ----------
+    pv_mesh : pyvista.PolyData
+        Triangulated surface mesh.
+    sampling_cfg : Mapping
+        Sampling configuration with ``curvature_weight`` (lambda),
+        ``curvature_exponent``, ``curvature_clip_percentile`` and ``min_weight``.
+
+    Returns
+    -------
+    np.ndarray
+        Per-cell weight array of shape ``(n_cells,)``.
+    """
+    lam = float(sampling_cfg.get("curvature_weight", 4.0))
+    exponent = float(sampling_cfg.get("curvature_exponent", 1.0))
+    clip_percentile = float(sampling_cfg.get("curvature_clip_percentile", 95.0))
+    min_weight = float(sampling_cfg.get("min_weight", 0.3))
+
+    # Point-based maximum principal curvature magnitude.
+    point_curvature = np.abs(pv_mesh.curvature(curv_type="maximum"))
+
+    # Average the vertex curvature onto each triangular cell.
+    faces = pv_mesh.regular_faces  # (n_cells, 3) for a triangulated surface
+    cell_curvature = point_curvature[faces].mean(axis=1)
+
+    # Clip extreme values so a handful of spiky cells do not dominate sampling.
+    clip_value = np.percentile(cell_curvature, clip_percentile)
+    if clip_value > 0:
+        cell_curvature = np.clip(cell_curvature, 0.0, clip_value)
+
+    # Normalize to [0, 1].
+    max_curvature = cell_curvature.max()
+    if max_curvature > 0:
+        normalized = cell_curvature / max_curvature
+    else:
+        normalized = np.zeros_like(cell_curvature)
+
+    weights = 1.0 + lam * (normalized**exponent)
+    return np.maximum(min_weight, weights)
+
+
+def sample_boundary_from_mesh(pv_mesh, num_points, sampling_cfg=None):
+    """Importance sampling on a triangulated surface using physicsnemo.mesh.
+
+    By default (``strategy="area"``) points are drawn uniformly per unit surface
+    area, reproducing the original behaviour. With ``strategy="curvature"`` the
+    per-cell draw probability is additionally weighted by a curvature-based
+    importance so that high-curvature regions are sampled more densely. In both
+    cases the returned per-point ``area`` is the unbiased Monte-Carlo estimate
+    ``area_i / (N * q_i)`` so that surface integrals (e.g. force) are preserved.
 
     Returns dict with ``x, y, z, normal_x, normal_y, normal_z, area`` arrays,
     matching the interface of the former ``Tessellation.sample_boundary``.
@@ -63,18 +119,39 @@ def sample_boundary_from_mesh(pv_mesh, num_points):
         cell_normals=True, point_normals=False, auto_orient_normals=True
     )
     cell_normals = pv_mesh.cell_data["Normals"]
-    areas = pv_mesh.compute_cell_sizes(length=False, volume=False)["Area"]
-    total_area = areas.sum()
+    areas = np.asarray(pv_mesh.compute_cell_sizes(length=False, volume=False)["Area"])
+
+    strategy = "area"
+    if sampling_cfg is not None:
+        strategy = sampling_cfg.get("strategy", "area")
+
+    if strategy == "curvature":
+        weights = areas * compute_cell_curvature_weights(pv_mesh, sampling_cfg)
+    elif strategy == "area":
+        weights = areas
+    else:
+        raise ValueError(
+            f"Unknown sampling strategy {strategy!r}. Expected 'area' or 'curvature'."
+        )
+
+    # Per-cell draw probability.
+    q = weights / weights.sum()
 
     mesh = from_pyvista(pv_mesh, manifold_dim=2)
 
-    probs = torch.tensor(areas / total_area, dtype=torch.float32)
+    probs = torch.tensor(q, dtype=torch.float32)
     cell_indices = torch.multinomial(probs, num_points, replacement=True)
+    cell_indices_np = cell_indices.numpy()
 
     pts = sample_random_points_on_cells(mesh, cell_indices).numpy()
 
-    normals = cell_normals[cell_indices.numpy()]
-    area_per_point = np.full((num_points, 1), total_area / num_points)
+    normals = cell_normals[cell_indices_np]
+
+    # Unbiased per-point area: area_i / (N * q_i). Reduces to total_area / N
+    # when the sampling is purely area-weighted (q_i = area_i / total_area).
+    area_per_point = (
+        areas[cell_indices_np] / (num_points * q[cell_indices_np])
+    ).reshape(-1, 1)
 
     return {
         "x": pts[:, 0:1],
@@ -172,7 +249,13 @@ def process_partition(graph, num_partitions, halo_hops):
 
 
 def process_run(
-    run_path, point_list, node_degree, num_partitions, halo_hops, save_point_cloud=False
+    run_path,
+    point_list,
+    node_degree,
+    num_partitions,
+    halo_hops,
+    save_point_cloud=False,
+    sampling_cfg=None,
 ):
     """Process a single run directory to generate a multi-level graph and apply partitioning."""
     run_id = os.path.basename(run_path).split("_")[-1]
@@ -219,7 +302,7 @@ def process_run(
 
         for num_points in sorted_points:
             # Sample the boundary points for the current level
-            boundary = sample_boundary_from_mesh(obj, num_points)
+            boundary = sample_boundary_from_mesh(obj, num_points, sampling_cfg)
             points = np.concatenate(
                 [boundary["x"], boundary["y"], boundary["z"]], axis=1
             )
@@ -328,6 +411,7 @@ def process_all_runs(
     halo_hops,
     num_workers=16,
     save_point_cloud=False,
+    sampling_cfg=None,
 ):
     """Process all runs in the base directory in parallel."""
 
@@ -338,7 +422,15 @@ def process_all_runs(
     ]
 
     tasks = [
-        (run_dir, num_points, node_degree, num_partitions, halo_hops, save_point_cloud)
+        (
+            run_dir,
+            num_points,
+            node_degree,
+            num_partitions,
+            halo_hops,
+            save_point_cloud,
+            sampling_cfg,
+        )
         for run_dir in run_dirs
     ]
 
@@ -355,6 +447,7 @@ def process_all_runs(
 @hydra.main(version_base="1.3", config_path="conf", config_name="config3d")
 def main(cfg: DictConfig) -> None:
     """Entry point for xaeronet surface preprocessing."""
+    sampling_cfg = OmegaConf.to_container(cfg.sampling, resolve=True) if "sampling" in cfg else None
     process_all_runs(
         base_path=to_absolute_path(cfg.data_path),
         num_points=cfg.num_nodes,
@@ -363,6 +456,7 @@ def main(cfg: DictConfig) -> None:
         halo_hops=cfg.num_message_passing_layers,
         num_workers=cfg.num_preprocess_workers,
         save_point_cloud=cfg.save_point_clouds,
+        sampling_cfg=sampling_cfg,
     )
 
 
