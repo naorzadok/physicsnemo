@@ -287,6 +287,18 @@ def sample_boundary_from_mesh(pv_mesh, num_points, sampling_cfg=None):
         areas[cell_indices_np] / (num_points * q[cell_indices_np])
     ).reshape(-1, 1)
 
+    # Optional sanity check: the per-point areas are an unbiased estimator of the
+    # total surface area, so their sum should match the true area closely. A large
+    # mismatch signals a reweighting bug.
+    if sampling_cfg is not None and sampling_cfg.get("debug_area_check", False):
+        true_area = float(areas.sum())
+        estimated_area = float(area_per_point.sum())
+        rel_error = abs(estimated_area - true_area) / max(true_area, 1e-12)
+        print(
+            f"[sampling] area check ({strategy}): true={true_area:.6g} "
+            f"estimated={estimated_area:.6g} rel_error={rel_error:.3%}"
+        )
+
     return {
         "x": pts[:, 0:1],
         "y": pts[:, 1:2],
