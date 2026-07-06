@@ -185,3 +185,5 @@ examples/cfd/external_aerodynamics/NACA0012_partitions/
 examples/cfd/external_aerodynamics/NACA0012_partitions_2part/
 examples/cfd/external_aerodynamics/xaeronet/surface/NACA0012_partitions/
 examples/cfd/external_aerodynamics/xaeronet/surface/point_clouds/
+examples/cfd/external_aerodynamics/xaeronet/surface/data_folders/
+examples/cfd/external_aerodynamics/xaeronet/surface/drivaer_data/
