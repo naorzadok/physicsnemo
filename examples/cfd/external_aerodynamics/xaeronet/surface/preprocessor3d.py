@@ -95,33 +95,29 @@ def _smooth_point_scalar(pv_mesh, values, iterations):
 
 
 def compute_cell_curvature_weights(pv_mesh, sampling_cfg):
-    """Compute a per-cell importance weight from surface curvature.
+    """Compute a normalized per-cell curvature importance in ``[0, 1]``.
 
     Uses the maximum principal curvature magnitude as a geometry-only proxy for
     regions where CFD gradients are likely to be strong (leading/trailing edges,
     fillets, mirrors, A-pillars, etc.). The point-based curvature is optionally
-    smoothed to suppress STL faceting noise, then averaged onto each triangle and
-    mapped to a bounded weight.
+    smoothed to suppress STL faceting noise, then averaged onto each triangle,
+    clipped and normalized.
 
     Parameters
     ----------
     pv_mesh : pyvista.PolyData
         Triangulated surface mesh.
     sampling_cfg : Mapping
-        Sampling configuration with ``curvature_weight`` (lambda),
-        ``curvature_exponent``, ``curvature_clip_percentile``,
-        ``curvature_smoothing_iterations`` and ``min_weight``.
+        Sampling configuration with ``curvature_clip_percentile`` and
+        ``curvature_smoothing_iterations``.
 
     Returns
     -------
     np.ndarray
-        Per-cell weight array of shape ``(n_cells,)``.
+        Per-cell curvature importance of shape ``(n_cells,)`` in ``[0, 1]``.
     """
-    lam = float(sampling_cfg.get("curvature_weight", 4.0))
-    exponent = float(sampling_cfg.get("curvature_exponent", 1.0))
     clip_percentile = float(sampling_cfg.get("curvature_clip_percentile", 95.0))
     smoothing_iterations = int(sampling_cfg.get("curvature_smoothing_iterations", 0))
-    min_weight = float(sampling_cfg.get("min_weight", 0.3))
 
     # Point-based maximum principal curvature magnitude.
     point_curvature = np.abs(pv_mesh.curvature(curv_type="maximum"))
@@ -143,11 +139,93 @@ def compute_cell_curvature_weights(pv_mesh, sampling_cfg):
     # Normalize to [0, 1].
     max_curvature = cell_curvature.max()
     if max_curvature > 0:
-        normalized = cell_curvature / max_curvature
-    else:
-        normalized = np.zeros_like(cell_curvature)
+        return cell_curvature / max_curvature
+    return np.zeros_like(cell_curvature)
 
-    weights = 1.0 + lam * (normalized**exponent)
+
+def compute_cell_edge_weights(pv_mesh, sampling_cfg):
+    """Compute a normalized per-cell feature-edge proximity importance in ``[0, 1]``.
+
+    Sharp feature edges (extracted by dihedral angle) mark creases and
+    trailing/leading edges where curvature alone can saturate. Each cell is
+    scored by its distance to the nearest feature edge through an exponential
+    falloff, so cells on or near an edge receive an importance close to ``1``.
+
+    Parameters
+    ----------
+    pv_mesh : pyvista.PolyData
+        Triangulated surface mesh.
+    sampling_cfg : Mapping
+        Sampling configuration with ``feature_edge_angle`` and
+        ``feature_edge_falloff`` (falloff length as a fraction of the mesh
+        bounding-box diagonal).
+
+    Returns
+    -------
+    np.ndarray
+        Per-cell edge-proximity importance of shape ``(n_cells,)`` in ``[0, 1]``.
+    """
+    feature_angle = float(sampling_cfg.get("feature_edge_angle", 30.0))
+    falloff_fraction = float(sampling_cfg.get("feature_edge_falloff", 0.02))
+
+    edges = pv_mesh.extract_feature_edges(
+        feature_angle=feature_angle,
+        boundary_edges=True,
+        non_manifold_edges=True,
+        feature_edges=True,
+        manifold_edges=False,
+    )
+
+    n_cells = pv_mesh.n_cells
+    if edges.n_points == 0:
+        return np.zeros(n_cells)
+
+    # Falloff length relative to the model size so the config is scale-invariant.
+    bbox = np.asarray(pv_mesh.bounds).reshape(3, 2)
+    diag = np.linalg.norm(bbox[:, 1] - bbox[:, 0])
+    falloff_length = max(falloff_fraction * diag, 1e-12)
+
+    centroids = pv_mesh.cell_centers().points
+    nbrs = NearestNeighbors(n_neighbors=1, algorithm="ball_tree").fit(edges.points)
+    distances, _ = nbrs.kneighbors(centroids)
+
+    return np.exp(-distances[:, 0] / falloff_length)
+
+
+def compute_cell_sampling_weights(pv_mesh, sampling_cfg):
+    """Combine curvature and feature-edge importance into a per-cell weight.
+
+    The weight multiplies the area-based draw probability. It starts from a base
+    of ``1`` (pure area weighting) and adds curvature and feature-edge terms,
+    then applies a floor so smooth regions are never fully starved.
+
+    Parameters
+    ----------
+    pv_mesh : pyvista.PolyData
+        Triangulated surface mesh.
+    sampling_cfg : Mapping
+        Sampling configuration.
+
+    Returns
+    -------
+    np.ndarray
+        Per-cell weight array of shape ``(n_cells,)``.
+    """
+    lam_curv = float(sampling_cfg.get("curvature_weight", 4.0))
+    exponent = float(sampling_cfg.get("curvature_exponent", 1.0))
+    lam_edge = float(sampling_cfg.get("feature_edge_weight", 0.0))
+    min_weight = float(sampling_cfg.get("min_weight", 0.3))
+
+    weights = np.ones(pv_mesh.n_cells)
+
+    if lam_curv > 0:
+        curvature_importance = compute_cell_curvature_weights(pv_mesh, sampling_cfg)
+        weights = weights + lam_curv * (curvature_importance**exponent)
+
+    if lam_edge > 0:
+        edge_importance = compute_cell_edge_weights(pv_mesh, sampling_cfg)
+        weights = weights + lam_edge * edge_importance
+
     return np.maximum(min_weight, weights)
 
 
@@ -176,7 +254,7 @@ def sample_boundary_from_mesh(pv_mesh, num_points, sampling_cfg=None):
         strategy = sampling_cfg.get("strategy", "area")
 
     if strategy == "curvature":
-        weights = areas * compute_cell_curvature_weights(pv_mesh, sampling_cfg)
+        weights = areas * compute_cell_sampling_weights(pv_mesh, sampling_cfg)
     elif strategy == "area":
         weights = areas
     else:
