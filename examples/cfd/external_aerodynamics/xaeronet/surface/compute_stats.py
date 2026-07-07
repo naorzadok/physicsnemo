@@ -54,13 +54,15 @@ def process_file(bin_file):
     # Initialize dictionaries to accumulate stats
     node_fields = ["coordinates", "normals", "area", "pressure", "shear_stress"]
     edge_fields = ["x"]
+    # Graph-level (global) features live on the graph, not on nodes/edges.
+    graph_fields = ["global_features"]
 
     field_means = {}
     field_square_means = {}
     counts = {}
 
     # Initialize stats accumulation for each partitioned graph
-    for field in node_fields + edge_fields:
+    for field in node_fields + edge_fields + graph_fields:
         field_means[field] = 0
         field_square_means[field] = 0
         counts[field] = 0
@@ -105,6 +107,25 @@ def process_file(bin_file):
             field_square_means[field] += field_square_mean * count
             counts[field] += count
 
+    # Process graph-level (global) data. These features are identical across
+    # every partition of a graph, so accumulate a single sample per file to
+    # avoid over-weighting graphs that happen to have more partitions. Skipped
+    # gracefully for legacy .bin files saved before global features existed.
+    if len(graphs) > 0:
+        reference_graph = graphs[0]
+        for field in graph_fields:
+            if field in reference_graph:
+                data = reference_graph[field].numpy()
+
+                if data.ndim == 1:
+                    data = np.expand_dims(data, axis=-1)
+
+                field_means[field] += np.mean(data, axis=0) * data.shape[0]
+                field_square_means[field] += np.mean(data**2, axis=0) * data.shape[0]
+                counts[field] += data.shape[0]
+            else:
+                print(f"Warning: Graph field '{field}' not found in {bin_file}")
+
     return field_means, field_square_means, counts
 
 
@@ -134,6 +155,10 @@ def aggregate_results(results):
     global_std = {}
 
     for field in total_mean:
+        # Skip fields that were never observed (e.g. global features absent from
+        # legacy .bin files) to avoid division by zero.
+        if total_count[field] == 0:
+            continue
         global_mean[field] = total_mean[field] / total_count[field]
         variance = (total_square_mean[field] / total_count[field]) - (
             global_mean[field] ** 2
