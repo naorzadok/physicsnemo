@@ -147,6 +147,15 @@ class GraphDataset(Dataset):
         self.edge_x_mean = torch.tensor(mean["x"])
         self.edge_x_std = torch.tensor(std["x"])
 
+        # Graph-level (global) feature stats are optional so that stats files
+        # produced before global features existed still load.
+        if "global_features" in mean:
+            self.global_features_mean = torch.tensor(mean["global_features"])
+            self.global_features_std = torch.tensor(std["global_features"])
+        else:
+            self.global_features_mean = None
+            self.global_features_std = None
+
     def __len__(self):
         return len(self.file_list)
 
@@ -167,6 +176,12 @@ class GraphDataset(Dataset):
                 part[key] = (part[key] - getattr(self, f"{key}_mean")) / getattr(
                     self, f"{key}_std"
                 )
+
+            # Normalize graph-level (global) features when stats are available.
+            if self.global_features_mean is not None and "global_features" in part:
+                part.global_features = (
+                    part.global_features - self.global_features_mean
+                ) / self.global_features_std
 
             part.edge_attr = (part.edge_attr - self.edge_x_mean) / self.edge_x_std
 
