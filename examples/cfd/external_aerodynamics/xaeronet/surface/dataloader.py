@@ -95,6 +95,17 @@ class PartitionedGraph:
                 if graph.is_node_attr(k):
                     setattr(partition, k, v[part_node])
 
+            # Propagate graph-level (global) attributes unchanged. These are
+            # neither node nor edge attributes (e.g. `global_features` of shape
+            # [1, F]), so they are copied as-is to every partition rather than
+            # being indexed by node/edge.
+            for k, v in graph.items():
+                if k in ("edge_index", "edge_attr", "num_nodes"):
+                    continue
+                if graph.is_node_attr(k) or graph.is_edge_attr(k):
+                    continue
+                setattr(partition, k, v)
+
             self.partitions.append(partition)
 
     def __len__(self):
