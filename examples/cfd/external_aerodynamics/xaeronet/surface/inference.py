@@ -113,6 +113,11 @@ def main(cfg: DictConfig) -> None:
     mean = stats["mean"]
     std = stats["std_dev"]
 
+    # Number of graph-level (global) features to append to each node's input.
+    # Derived from the stats file so it stays 0 for datasets/checkpoints that
+    # predate global features.
+    num_global_features = len(mean.get("global_features", []))
+
     # Create DataLoader
     test_dataloader = create_dataloader(
         test_dataset,
@@ -143,7 +148,7 @@ def main(cfg: DictConfig) -> None:
 
     # Initialize model
     model = MeshGraphNet(
-        input_dim_nodes=24,
+        input_dim_nodes=24 + num_global_features,
         input_dim_edges=4,
         output_dim=4,
         processor_size=cfg.num_message_passing_layers,
@@ -202,20 +207,21 @@ def main(cfg: DictConfig) -> None:
             part = part.to(device)
 
             # Get node features (coordinates and normals)
-            ndata = torch.cat(
-                (
-                    part.coordinates,
-                    part.normals,
-                    torch.sin(2 * np.pi * part.coordinates),
-                    torch.cos(2 * np.pi * part.coordinates),
-                    torch.sin(4 * np.pi * part.coordinates),
-                    torch.cos(4 * np.pi * part.coordinates),
-                    torch.sin(8 * np.pi * part.coordinates),
-                    torch.cos(8 * np.pi * part.coordinates),
-                    # part.sdf,
-                ),
-                dim=1,
-            )
+            node_features = [
+                part.coordinates,
+                part.normals,
+                torch.sin(2 * np.pi * part.coordinates),
+                torch.cos(2 * np.pi * part.coordinates),
+                torch.sin(4 * np.pi * part.coordinates),
+                torch.cos(4 * np.pi * part.coordinates),
+                torch.sin(8 * np.pi * part.coordinates),
+                torch.cos(8 * np.pi * part.coordinates),
+                # part.sdf,
+            ]
+            # Broadcast graph-level (global) features to every node.
+            if "global_features" in part:
+                node_features.append(part.global_features.expand(part.num_nodes, -1))
+            ndata = torch.cat(node_features, dim=1)
 
             with torch.inference_mode():
                 with torch.autocast(amp_device, enabled=True, dtype=amp_dtype):
