@@ -27,6 +27,7 @@ samples simultaneously, improving efficiency. Additionally, it provides an optio
 save the point cloud of each graph for visualization purposes.
 """
 
+import contextlib
 import os
 import vtk
 import pyvista as pv
@@ -50,6 +51,24 @@ from physicsnemo.mesh.sampling import sample_random_points_on_cells
 def load_stl_mesh(stl_file):
     """Load an STL file and return a PyVista triangular surface mesh."""
     return pv.read(stl_file)
+
+
+@contextlib.contextmanager
+def _suppress_vtk_warnings():
+    """Temporarily silence VTK's global warning output.
+
+    ``vtkCurvatures`` emits per-point warnings on faceted/degenerate STL
+    triangles where the maximum curvature is ill-conditioned. These are
+    expected on tessellated CAD surfaces and would otherwise flood the log with
+    thousands of lines; the resulting spikes are handled downstream by
+    sanitizing, smoothing and percentile clipping.
+    """
+    previous = vtk.vtkObject.GetGlobalWarningDisplay()
+    vtk.vtkObject.GlobalWarningDisplayOff()
+    try:
+        yield
+    finally:
+        vtk.vtkObject.SetGlobalWarningDisplay(previous)
 
 
 def _smooth_point_scalar(pv_mesh, values, iterations):
@@ -119,8 +138,15 @@ def compute_cell_curvature_weights(pv_mesh, sampling_cfg):
     clip_percentile = float(sampling_cfg.get("curvature_clip_percentile", 95.0))
     smoothing_iterations = int(sampling_cfg.get("curvature_smoothing_iterations", 0))
 
-    # Point-based maximum principal curvature magnitude.
-    point_curvature = np.abs(pv_mesh.curvature(curv_type="maximum"))
+    # Point-based maximum principal curvature magnitude. The maximum curvature
+    # is ill-conditioned on degenerate/duplicated STL triangles, so silence the
+    # per-point VTK warnings and replace any non-finite results with zero (they
+    # are refilled from neighbors by the smoothing pass below).
+    with _suppress_vtk_warnings():
+        point_curvature = np.abs(pv_mesh.curvature(curv_type="maximum"))
+    point_curvature = np.nan_to_num(
+        point_curvature, nan=0.0, posinf=0.0, neginf=0.0
+    )
 
     # Denoise the faceting-induced curvature spikes before mapping to cells.
     point_curvature = _smooth_point_scalar(
@@ -406,7 +432,7 @@ def process_run(
     """Process a single run directory to generate a multi-level graph and apply partitioning."""
     run_id = os.path.basename(run_path).split("_")[-1]
 
-    stl_file = os.path.join(run_path, f"drivaer_{run_id}_single_solid.stl")
+    stl_file = os.path.join(run_path, f"drivaer_{run_id}.stl")
     vtp_file = os.path.join(run_path, f"boundary_{run_id}.vtp")
 
     # Path to save the list of partitions
@@ -512,6 +538,24 @@ def process_run(
 
         graph = add_edge_features(graph)
 
+        # --- Graph-level (global) features ---------------------------------
+        # Global features describe the whole graph rather than individual nodes
+        # or edges. In PyG the convention is to store them with a leading
+        # dimension of 1 (shape [1, F]) so that batching several graphs
+        # concatenates them into a [num_graphs, F] tensor. Because the first
+        # dim (1) matches neither num_nodes nor num_edges, PyG classifies this
+        # as a graph-level attribute automatically.
+        #
+        # The example below uses purely geometric descriptors (bounding-box
+        # extents + total surface area). Replace/extend this with the physical
+        # inputs you care about (e.g. inlet velocity, Reynolds number, yaw
+        # angle, ...).
+        bbox_size = all_points.max(axis=0) - all_points.min(axis=0)
+        global_features = np.concatenate([bbox_size, [float(all_areas.sum())]])
+        graph.global_features = torch.tensor(
+            global_features, dtype=torch.float32
+        ).unsqueeze(0)  # shape [1, F]
+
         # PyG ClusterData uses `x` attribute of the source graph to set the number of nodes in each partition.
         # This is required to make ClusterData indexing work properly. The real value of `x` will
         # be set in a trainer, so set `x` to a NaN tensor to make sure it is not used.
@@ -537,7 +581,7 @@ def process_run(
 
             multi_point_cloud = pv.MultiBlock(parts)
             for part_id in range(len(parts)):
-                multi_point_cloud[part_id].name = part_id
+                multi_point_cloud.set_block_name(part_id, str(part_id))
             vtp_file_path = to_absolute_path(f"point_clouds/point_cloud_{run_id}.vtm")
             os.makedirs(os.path.dirname(vtp_file_path), exist_ok=True)
             multi_point_cloud.save(vtp_file_path)
