@@ -25,15 +25,15 @@ hydra:
 # │            Data Preprocessing             │
 # └───────────────────────────────────────────┘
 
-num_nodes: [100000, 200000, 400000]                  # Number of nodes in the graphs
+num_nodes: [40000]                  # Number of nodes in the graphs
 node_degree: 6                                       # Degree of the nodes in the graphs
 num_partitions: 3                                    # Number of partitions for each graph
-data_path: /drivaer_data       # Path to the raw data
+data_path: /workspace/examples/cfd/external_aerodynamics/xaeronet/surface/data_folders/drivaer_data       # Path to the raw data
 num_preprocess_workers: 8                           # Number of workers for data preprocessing
-save_point_clouds: false                             # Save point clouds for the preprocessed data
+save_point_clouds: true                             # Save point clouds for the preprocessed data
 
 sampling:                                            # Boundary point sampling strategy
-  strategy: area                                     # "area" (uniform per unit area) or "curvature" (denser in high-curvature regions)
+  strategy: curvature                                     # "area" (uniform per unit area) or "curvature" (denser in high-curvature regions)
   curvature_weight: 4.0                              # lambda: strength of curvature bias (higher -> denser at features)
   curvature_exponent: 1.0                            # exponent applied to normalized curvature before weighting
   curvature_clip_percentile: 95.0                    # clip curvature at this percentile to avoid a few spikes dominating
@@ -43,7 +43,7 @@ sampling:                                            # Boundary point sampling s
   feature_edge_falloff: 0.02                          # proximity falloff length as a fraction of the mesh bounding-box diagonal
   density_exponent: 1.0                               # size-field contrast: sampling density scales as weight^p (>1 sharpens, <1 flattens)
   min_weight: 0.3                                    # floor on the per-cell weight so smooth regions are not starved
-  debug_area_check: false                             # log the Monte-Carlo total-area estimate vs true area to validate reweighting
+  debug_area_check: true                             # log the Monte-Carlo total-area estimate vs true area to validate reweighting
 
 # ┌───────────────────────────────────────────┐
 # │           Model Configuration             │
