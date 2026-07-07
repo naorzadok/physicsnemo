@@ -96,6 +96,11 @@ def main(cfg: DictConfig) -> None:
     mean = stats["mean"]
     std = stats["std_dev"]
 
+    # Number of graph-level (global) features to append to each node's input.
+    # Derived from the stats file so it stays 0 for datasets/checkpoints that
+    # predate global features.
+    num_global_features = len(mean.get("global_features", []))
+
     # Create DataLoader
     train_dataloader = create_dataloader(
         train_dataset,
@@ -127,7 +132,7 @@ def main(cfg: DictConfig) -> None:
 
     # Initialize model
     model = MeshGraphNet(
-        input_dim_nodes=24,
+        input_dim_nodes=24 + num_global_features,
         input_dim_edges=4,
         output_dim=4,
         processor_size=cfg.num_message_passing_layers,
@@ -180,19 +185,22 @@ def main(cfg: DictConfig) -> None:
             for part in graph_partitions:
                 with torch.autocast(amp_device, enabled=True, dtype=amp_dtype):
                     part = part.to(device)
-                    ndata = torch.cat(
-                        (
-                            part.coordinates,
-                            part.normals,
-                            torch.sin(2 * np.pi * part.coordinates),
-                            torch.cos(2 * np.pi * part.coordinates),
-                            torch.sin(4 * np.pi * part.coordinates),
-                            torch.cos(4 * np.pi * part.coordinates),
-                            torch.sin(8 * np.pi * part.coordinates),
-                            torch.cos(8 * np.pi * part.coordinates),
-                        ),
-                        dim=1,
-                    )
+                    node_features = [
+                        part.coordinates,
+                        part.normals,
+                        torch.sin(2 * np.pi * part.coordinates),
+                        torch.cos(2 * np.pi * part.coordinates),
+                        torch.sin(4 * np.pi * part.coordinates),
+                        torch.cos(4 * np.pi * part.coordinates),
+                        torch.sin(8 * np.pi * part.coordinates),
+                        torch.cos(8 * np.pi * part.coordinates),
+                    ]
+                    # Broadcast graph-level (global) features to every node.
+                    if "global_features" in part:
+                        node_features.append(
+                            part.global_features.expand(part.num_nodes, -1)
+                        )
+                    ndata = torch.cat(node_features, dim=1)
                     pred = model(ndata, part.edge_attr, part)[part.inner_node]
                     target = torch.cat((part.pressure, part.shear_stress), dim=1)[
                         part.inner_node
@@ -274,19 +282,22 @@ def main(cfg: DictConfig) -> None:
                     part = part.to(device)
 
                     # Get node features (coordinates and normals)
-                    ndata = torch.cat(
-                        (
-                            part.coordinates,
-                            part.normals,
-                            torch.sin(2 * np.pi * part.coordinates),
-                            torch.cos(2 * np.pi * part.coordinates),
-                            torch.sin(4 * np.pi * part.coordinates),
-                            torch.cos(4 * np.pi * part.coordinates),
-                            torch.sin(8 * np.pi * part.coordinates),
-                            torch.cos(8 * np.pi * part.coordinates),
-                        ),
-                        dim=1,
-                    )
+                    node_features = [
+                        part.coordinates,
+                        part.normals,
+                        torch.sin(2 * np.pi * part.coordinates),
+                        torch.cos(2 * np.pi * part.coordinates),
+                        torch.sin(4 * np.pi * part.coordinates),
+                        torch.cos(4 * np.pi * part.coordinates),
+                        torch.sin(8 * np.pi * part.coordinates),
+                        torch.cos(8 * np.pi * part.coordinates),
+                    ]
+                    # Broadcast graph-level (global) features to every node.
+                    if "global_features" in part:
+                        node_features.append(
+                            part.global_features.expand(part.num_nodes, -1)
+                        )
+                    ndata = torch.cat(node_features, dim=1)
 
                     with torch.no_grad():
                         with torch.autocast(amp_device, enabled=True, dtype=amp_dtype):
