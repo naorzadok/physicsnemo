@@ -25,7 +25,7 @@ hydra:
 # │            Data Preprocessing             │
 # └───────────────────────────────────────────┘
 
-num_nodes: [40000]                  # Number of nodes in the graphs
+num_nodes: [10000,20000,40000]                  # Number of nodes in the graphs
 node_degree: 6                                       # Degree of the nodes in the graphs
 num_partitions: 3                                    # Number of partitions for each graph
 data_path: /workspace/examples/cfd/external_aerodynamics/xaeronet/surface/data_folders/drivaer_data       # Path to the raw data
@@ -62,7 +62,7 @@ validation_partitions_path: validation_partitions   # Path to the validation par
 test_partitions_path: test_partitions               # Path to the test partitions (.bin files)
 stats_file: global_stats.json                       # Path to the global statistics (.json file)
 checkpoint_filename: model_checkpoint.pth           # Filename of the model checkpoint
-num_epochs: 2000                                    # Number of epochs
+num_epochs: 2                                    # Number of epochs
 start_lr: 0.001                                     # Initial learning rate (cos annealing schedule is used)
 end_lr: 0.000001                                    # Final learning rate (cos annealing schedule is used)
 save_checkpoint_freq: 5                             # Frequency of saving the model checkpoint
@@ -75,3 +75,25 @@ validation_freq: 50                                 # Frequency of validation
 use_concat_trick: true                              # Use the concatenation trick
 checkpoint_segments: 3                              # Number of segments for the activation checkpointing
 enable_cudnn_benchmark: true                        # Enable cudnn benchmark
+
+# ┌───────────────────────────────────────────┐
+# │      Aerodynamic Coefficient Post-Proc    │
+# └───────────────────────────────────────────┘
+
+aero_coefficients:                                  # Integrate pre-normalized surface fields into force/moment coefficients
+  input_file: null                                  # Path to a single .vtp file (null to use input_dir)
+  input_dir: null                                   # Directory scanned for *.vtp files (null to use input_file)
+  coordinates_key: coordinates                      # Point-data array name for coordinates (falls back to mesh points)
+  normals_key: normals                              # Point-data array name for surface unit normals
+  area_key: area                                    # Point-data array name for per-point tributary area
+  pressure_key: pressure                            # Point-data array name for the normalized pressure (Cp)
+  shear_stress_key: shear_stress                    # Point-data array name for the normalized wall shear stress vector
+  mrc: [0.0, 0.0, 0.0]                              # Moment reference center (x, y, z)
+  convention: alpha_beta                            # "alpha_beta" or "alpha_phi" (aeroballistic total-AoA + roll)
+  alpha: 0.0                                        # Body-axis pitch angle of attack in degrees (used when convention=alpha_beta)
+  beta: 0.0                                         # Sideslip angle in degrees (used when convention=alpha_beta)
+  alpha_total: 0.0                                  # Total angle of attack in degrees (used when convention=alpha_phi)
+  phi_aerodynamic: 0.0                              # Aerodynamic roll angle in degrees (used when convention=alpha_phi)
+  output_frame: both                                # Coefficient frame(s) to report: "body", "wind" or "both"
+  ref_area: 1.0                                     # Reference area for force coefficients (1.0 since fields are pre-normalized)
+  ref_length: 1.0                                   # Reference length for moment coefficients
