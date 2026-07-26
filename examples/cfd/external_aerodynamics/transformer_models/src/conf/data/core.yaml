@@ -16,9 +16,9 @@
 
 # Paths to your data:
 train:
-  data_path:  /lustre/fsw/portfolios/coreai/projects/coreai_modulus_cae/datasets/drivaer_aws/domino/train/
+  data_path:  /workspace/drivaer_zarr/train/
 val:
-  data_path: /lustre/fsw/portfolios/coreai/projects/coreai_modulus_cae/datasets/drivaer_aws/domino/val/
+  data_path: /workspace/drivaer_zarr/val/
 
 # You can set a normalization factor directory:
 normalization_dir: "src/"
@@ -30,10 +30,10 @@ preload_depth: 1
 pin_memory: true
 
 # Sampling resolution of the point clouds:
-resolution: 200_000
+resolution: 20_000
 
 # Surface / Volume / (combined, if supported)
-mode: ???
+mode: Surface
 
 # For building embeddings: include normal directions for each point?
 include_normals: true

@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-num_epochs: 501
-save_interval: 25
+num_epochs: 11
+save_interval: 5
 
 scheduler:
   name: "StepLR"

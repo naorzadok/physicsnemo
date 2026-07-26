@@ -50,11 +50,16 @@ from physicsnemo.utils.logging import PythonLogger, RankZeroLoggingWrapper
 from physicsnemo.distributed import DistributedManager
 from physicsnemo.utils.profiling import profile, Profiler
 from physicsnemo.datapipes.cae.transolver_datapipe import (
-    create_transolver_dataset,
     TransolverDataPipe,
 )
 
 # Local folder imports for this example
+# Config-driven global-feature datapipe (Option B). Drop-in replacement for the
+# library ``create_transolver_dataset`` that supports an arbitrary, config-driven
+# list of global features via ``cfg.data.global_feature_keys``.
+from global_features_datapipe import (
+    create_global_features_transolver_dataset as create_transolver_dataset,
+)
 from metrics import metrics_fn
 
 from physicsnemo.nn import collect_concrete_dropout_losses, get_concrete_dropout_rates
@@ -276,12 +281,12 @@ def forward_pass(
 
     """
 
-    features = batch["fx"]
+    features = batch.get("fx", None)
     embeddings = batch["embeddings"]
     targets = batch["fields"]
 
     # Cast precisions:
-    features = cast_precisions(features, precision=precision)
+    features = cast_precisions(features, precision=precision) if features is not None else None
     embeddings = cast_precisions(embeddings, precision=precision)
     if "geometry" in batch.keys():
         geometry = cast_precisions(batch["geometry"], precision=precision)
@@ -305,7 +310,8 @@ def forward_pass(
     with get_autocast_context(precision):
         # For fp8, we may have to pad the inputs:
         if precision == "float8" and TE_AVAILABLE:
-            features, geometry = pad_input_for_fp8(features, embeddings, geometry)
+            if features is not None:
+                features, geometry = pad_input_for_fp8(features, embeddings, geometry)
 
         if "geometry" in batch.keys():
             local_positions = embeddings[:, :, :3]
@@ -680,11 +686,12 @@ def main(cfg: DictConfig):
 
     model.to(dist_manager.device)
 
-    model = torch.nn.parallel.DistributedDataParallel(
-        model,
-        device_ids=[dist_manager.local_rank],
-        output_device=dist_manager.device,
-    )
+    if dist_manager.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[dist_manager.local_rank],
+            output_device=dist_manager.device,
+        )
 
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Number of parameters: {num_params}")
@@ -853,7 +860,7 @@ def main(cfg: DictConfig):
     logger.info("Training completed!")
 
 
-@hydra.main(version_base=None, config_path="conf", config_name="train_surface")
+@hydra.main(version_base=None, config_path="conf", config_name="geotransolver_surface")
 def launch(cfg: DictConfig):
     """Launch training with hydra configuration
 

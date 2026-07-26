@@ -16,11 +16,11 @@
 
 _target_: physicsnemo.experimental.models.geotransolver.GeoTransolver
 functional_dim: 6
-global_dim: 2
+global_dim: null
 geometry_dim: 3
 out_dim: 4
-n_layers: 20
-n_hidden: 256
+n_layers: 6
+n_hidden: 128
 dropout: 0.0
 n_head: 8
 act: "gelu"
