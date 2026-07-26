@@ -25,7 +25,7 @@ hydra:
 # │            Data Preprocessing             │
 # └───────────────────────────────────────────┘
 
-num_nodes: [10000,20000,40000]                  # Number of nodes in the graphs
+num_nodes: [10000,20000,40000]                  # Nodes per resolution level; >1 entry auto-enables multi-resolution (cumulative kNN, long-range edges), a single entry uses a plain kNN graph
 node_degree: 6                                       # Degree of the nodes in the graphs
 num_partitions: 3                                    # Number of partitions for each graph
 data_path: /workspace/examples/cfd/external_aerodynamics/xaeronet/surface/data_folders/drivaer_data       # Path to the raw data
@@ -67,7 +67,6 @@ zarr_valid_path: /workspace/drivaer_zarr/val        # Dir of validation *.zarr s
 num_sampled_nodes: 100000                           # Points subsampled per cloud on the CPU worker (null = keep all)
 num_dataloader_workers: 4                           # DataLoader workers for the raw-Zarr loader
 no_partition: false                                 # true -> whole geometry as a single graph (no spatial partitioning)
-use_multiresolution: false                          # true -> multi-resolution sampling using num_nodes levels (cumulative kNN, long-range edges)
 
 stats_file: global_stats.json                       # Path to the global statistics (.json file)
 checkpoint_filename: model_checkpoint.pth           # Filename of the model checkpoint

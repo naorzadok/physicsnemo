@@ -172,7 +172,8 @@ def main(cfg: DictConfig) -> None:
     print(f"Computing statistics from {len(stores)} store(s) on {device}")
 
     # Multi-resolution level sizes (edge stats must match the training graph).
-    level_sizes = list(cfg.num_nodes) if cfg.get("use_multiresolution", False) else None
+    # Enabled automatically when num_nodes lists more than one level.
+    level_sizes = list(cfg.num_nodes) if len(cfg.num_nodes) > 1 else None
 
     mean, std = compute_stats(
         stores,
