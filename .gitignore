@@ -189,3 +189,12 @@ examples/cfd/external_aerodynamics/xaeronet/surface/partitions/
 examples/cfd/external_aerodynamics/xaeronet/surface/outputs/
 examples/cfd/external_aerodynamics/xaeronet/surface/data_folders/
 examples/cfd/external_aerodynamics/xaeronet/surface/drivaer_data/
+
+# Dynamic-graph pipeline: raw datasets and generated artifacts
+drivaer_zarr/
+examples/cfd/external_aerodynamics/xaeronet/surface/global_stats.json
+examples/cfd/external_aerodynamics/xaeronet/surface/_hmgn_smoke_test.py
+
+# Transformer models training run outputs
+examples/cfd/external_aerodynamics/transformer_models/runs/
+examples/cfd/external_aerodynamics/transformer_models/src/runs/
