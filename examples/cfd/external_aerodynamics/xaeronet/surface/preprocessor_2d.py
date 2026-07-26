@@ -47,7 +47,7 @@ from omegaconf import DictConfig
 from physicsnemo.datapipes.cae.readers import read_vtp
 from physicsnemo.sym.geometry.tessellation import Tessellation
 
-from dataloader_CFD import PartitionedGraph
+from dataloader_2d import PartitionedGraph
 
 def calculate_area(points):
     nbrs = NearestNeighbors(n_neighbors=3, algorithm='ball_tree').fit(points)

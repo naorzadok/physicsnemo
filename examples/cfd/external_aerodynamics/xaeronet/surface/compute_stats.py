@@ -163,9 +163,16 @@ def aggregate_results(results):
         variance = (total_square_mean[field] / total_count[field]) - (
             global_mean[field] ** 2
         )
-        global_std[field] = np.sqrt(
+        std = np.sqrt(
             np.maximum(variance, 0)
         )  # Ensure no negative variance due to rounding errors
+
+        # Guard against zero-variance components (e.g. a constant feature or a
+        # single-sample dataset). A zero std would divide by zero during
+        # normalization and produce NaNs, so store 1.0 instead, which leaves
+        # the (already constant) feature unchanged.
+        std = np.where(std < 1e-8, 1.0, std)
+        global_std[field] = std
 
     return global_mean, global_std
 

@@ -50,7 +50,7 @@ from physicsnemo.models.meshgraphnet import MeshGraphNet
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
 
-from dataloader_CFD import create_dataloader
+from dataloader_2d import create_dataloader
 from utils import (
     find_bin_files,
     save_checkpoint,
