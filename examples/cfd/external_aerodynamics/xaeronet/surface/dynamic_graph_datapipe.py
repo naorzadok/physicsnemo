@@ -440,7 +440,7 @@ class DynamicGraphBuilder:
         given, every node is kept (identity order).
         """
         if weights is not None:
-            w = weights.to(device=device, dtype=torch.float32).reshape(-1)
+            w = torch.as_tensor(weights, device=device, dtype=torch.float32).reshape(-1)
             w = torch.clamp(w, min=0.0)
             total = min(total, int((w > 0).sum().item()))
             return torch.multinomial(

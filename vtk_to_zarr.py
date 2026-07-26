@@ -542,6 +542,160 @@ def read_volume(source, specs, location_mode: str) -> dict[str, np.ndarray]:
 
 
 # --------------------------------------------------------------------------- #
+# Importance-sampling weights (curvature + feature edges)
+# --------------------------------------------------------------------------- #
+# Precomputed per-surface-point weights that bias the dynamic-graph node
+# subsampling toward high-curvature / feature-edge regions (where CFD gradients
+# are strongest), so the GNN can resolve hard physics. Computing them here (once,
+# at conversion) keeps training fully GPU-accelerated: the training step only
+# does a cheap weighted draw using this array. The logic mirrors
+# ``preprocessor3d.py`` but is self-contained (PyVista + NumPy + SciPy only).
+
+SAMPLING_WEIGHT_DEFAULTS: dict[str, float] = {
+    "curvature_weight": 4.0,
+    "curvature_exponent": 1.0,
+    "curvature_clip_percentile": 95.0,
+    "curvature_smoothing_iterations": 5.0,
+    "feature_edge_weight": 2.0,
+    "feature_edge_angle": 30.0,
+    "feature_edge_falloff": 0.02,
+    "density_exponent": 1.0,
+    "min_weight": 0.3,
+}
+
+
+def _polydata_from_stl_arrays(
+    coords: np.ndarray, faces_flat: np.ndarray
+) -> "pv.PolyData":
+    """Rebuild a triangular ``pv.PolyData`` from stored ``stl_*`` arrays."""
+    faces = np.asarray(faces_flat, dtype=np.int64).reshape(-1, 3)
+    vtk_faces = np.hstack(
+        [np.full((faces.shape[0], 1), 3, dtype=np.int64), faces]
+    ).reshape(-1)
+    return pv.PolyData(np.asarray(coords, dtype=np.float32), vtk_faces)
+
+
+def _smooth_point_scalar(
+    mesh: "pv.PolyData", values: np.ndarray, iterations: int
+) -> np.ndarray:
+    """Umbrella (neighbor-average) smoothing of a per-vertex scalar field."""
+    if iterations <= 0:
+        return values
+    faces = mesh.regular_faces
+    edges = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    n_points = mesh.n_points
+    smoothed = values.astype(np.float64, copy=True)
+    for _ in range(iterations):
+        summed = np.zeros(n_points, dtype=np.float64)
+        counts = np.zeros(n_points, dtype=np.float64)
+        np.add.at(summed, edges[:, 0], smoothed[edges[:, 1]])
+        np.add.at(summed, edges[:, 1], smoothed[edges[:, 0]])
+        np.add.at(counts, edges[:, 0], 1.0)
+        np.add.at(counts, edges[:, 1], 1.0)
+        nz = counts > 0
+        smoothed[nz] = summed[nz] / counts[nz]
+    return smoothed
+
+
+def _cell_curvature_weights(mesh: "pv.PolyData", cfg: dict) -> np.ndarray:
+    """Normalized ``[0, 1]`` per-cell maximum-curvature importance."""
+    clip_percentile = float(cfg.get("curvature_clip_percentile", 95.0))
+    smoothing_iterations = int(cfg.get("curvature_smoothing_iterations", 0))
+
+    # vtkCurvatures spams per-point warnings on faceted STL triangles; silence.
+    try:
+        import vtk
+
+        prev = vtk.vtkObject.GetGlobalWarningDisplay()
+        vtk.vtkObject.GlobalWarningDisplayOff()
+    except Exception:
+        vtk = None
+        prev = None
+    try:
+        point_curv = np.abs(mesh.curvature(curv_type="maximum"))
+    finally:
+        if vtk is not None and prev is not None:
+            vtk.vtkObject.SetGlobalWarningDisplay(prev)
+
+    point_curv = np.nan_to_num(point_curv, nan=0.0, posinf=0.0, neginf=0.0)
+    point_curv = _smooth_point_scalar(mesh, point_curv, smoothing_iterations)
+
+    cell_curv = point_curv[mesh.regular_faces].mean(axis=1)
+    clip_value = np.percentile(cell_curv, clip_percentile)
+    if clip_value > 0:
+        cell_curv = np.clip(cell_curv, 0.0, clip_value)
+    max_curv = cell_curv.max()
+    return cell_curv / max_curv if max_curv > 0 else np.zeros_like(cell_curv)
+
+
+def _cell_edge_weights(mesh: "pv.PolyData", cfg: dict) -> np.ndarray:
+    """Normalized ``[0, 1]`` per-cell proximity to sharp feature edges."""
+    from scipy.spatial import cKDTree
+
+    feature_angle = float(cfg.get("feature_edge_angle", 30.0))
+    falloff_fraction = float(cfg.get("feature_edge_falloff", 0.02))
+
+    edges = mesh.extract_feature_edges(
+        feature_angle=feature_angle,
+        boundary_edges=True,
+        non_manifold_edges=True,
+        feature_edges=True,
+        manifold_edges=False,
+    )
+    if edges.n_points == 0:
+        return np.zeros(mesh.n_cells)
+
+    bbox = np.asarray(mesh.bounds).reshape(3, 2)
+    diag = np.linalg.norm(bbox[:, 1] - bbox[:, 0])
+    falloff_length = max(falloff_fraction * diag, 1e-12)
+
+    centroids = np.asarray(mesh.cell_centers().points)
+    tree = cKDTree(np.asarray(edges.points))
+    distances, _ = tree.query(centroids, k=1)
+    return np.exp(-distances / falloff_length)
+
+
+def _cell_sampling_weights(mesh: "pv.PolyData", cfg: dict) -> np.ndarray:
+    """Combine curvature + feature-edge importance into a per-cell weight."""
+    lam_curv = float(cfg.get("curvature_weight", 4.0))
+    exponent = float(cfg.get("curvature_exponent", 1.0))
+    lam_edge = float(cfg.get("feature_edge_weight", 0.0))
+    density_exponent = float(cfg.get("density_exponent", 1.0))
+    min_weight = float(cfg.get("min_weight", 0.3))
+
+    weights = np.ones(mesh.n_cells)
+    if lam_curv > 0:
+        weights = weights + lam_curv * (_cell_curvature_weights(mesh, cfg) ** exponent)
+    if lam_edge > 0:
+        weights = weights + lam_edge * _cell_edge_weights(mesh, cfg)
+    if density_exponent != 1.0:
+        weights = weights ** density_exponent
+    return np.maximum(min_weight, weights)
+
+
+def compute_sampling_weights(
+    stl_coordinates: np.ndarray,
+    stl_faces: np.ndarray,
+    surface_centers: np.ndarray,
+    cfg: dict,
+) -> np.ndarray:
+    """Per-surface-point importance weights from STL curvature / feature edges.
+
+    Per-cell weights are computed on the STL geometry, then transferred to each
+    surface point by nearest STL-cell centroid. Returns a ``(N_surface,)``
+    float32 array aligned with ``surface_mesh_centers``.
+    """
+    from scipy.spatial import cKDTree
+
+    mesh = _polydata_from_stl_arrays(stl_coordinates, stl_faces)
+    cell_weights = _cell_sampling_weights(mesh, cfg)
+    cell_centers = np.asarray(mesh.cell_centers().points)
+    tree = cKDTree(cell_centers)
+    _, nearest = tree.query(np.asarray(surface_centers, dtype=np.float32), k=1)
+    return cell_weights[nearest].astype(np.float32)
+
+
+# --------------------------------------------------------------------------- #
 # Zarr writing
 # --------------------------------------------------------------------------- #
 def _compute_chunks(shape: tuple[int, ...], itemsize: int, target_mb: float) -> tuple[int, ...]:
@@ -629,6 +783,7 @@ def build_sample(
     volume_location: str,
     synth_stl: bool,
     timings: bool = False,
+    sampling_cfg: dict | None = None,
 ) -> tuple[dict[str, np.ndarray], dict]:
     """Read all inputs of a sample into DoMINO arrays + attributes."""
     arrays: dict[str, np.ndarray] = {}
@@ -691,7 +846,79 @@ def build_sample(
             attrs["volume_fields_meta"] = meta
         _log_stage("volume fields", t)
 
+    # Importance-sampling weights ------------------------------------------- #
+    # Precompute per-surface-point weights from STL curvature / feature edges so
+    # the dynamic-graph pipeline can bias node subsampling toward hard-physics
+    # regions without any per-step mesh work.
+    if (
+        sampling_cfg is not None
+        and "stl_coordinates" in arrays
+        and "stl_faces" in arrays
+        and "surface_mesh_centers" in arrays
+    ):
+        t = time.perf_counter()
+        try:
+            arrays["sampling_weight"] = compute_sampling_weights(
+                arrays["stl_coordinates"],
+                arrays["stl_faces"],
+                arrays["surface_mesh_centers"],
+                sampling_cfg,
+            )
+            attrs["sampling_weight_cfg"] = {k: float(v) for k, v in sampling_cfg.items()}
+        except Exception as exc:  # keep conversion robust to odd geometry
+            logger.warning("[%s] sampling weights failed: %s", sample.name, exc)
+        _log_stage("sampling weights", t)
+
     return arrays, attrs
+
+
+def backfill_sampling_weights(
+    path: Path, sampling_cfg: dict, *, overwrite: bool = False
+) -> int:
+    """Add a ``sampling_weight`` array to already-converted ``.zarr`` stores.
+
+    ``path`` may be a single ``.zarr`` store or a directory tree containing
+    them. Each store's weights are computed from its stored ``stl_*`` arrays and
+    written in place. Returns the number of stores updated.
+    """
+    import zarr
+
+    if path.suffix == ".zarr" and path.is_dir():
+        stores = [path]
+    else:
+        stores = sorted(p for p in path.rglob("*.zarr") if p.is_dir())
+    if not stores:
+        logger.warning("No .zarr stores found under %s", path)
+        return 0
+
+    updated = 0
+    for store_path in tqdm(stores, desc="Backfilling weights", unit="store"):
+        group = zarr.open_group(str(store_path), mode="a")
+        keys = set(group.array_keys())
+        if "sampling_weight" in keys and not overwrite:
+            logger.info("%s already has sampling_weight; skipping", store_path.name)
+            continue
+        missing = {"stl_coordinates", "stl_faces", "surface_mesh_centers"} - keys
+        if missing:
+            logger.warning("%s missing %s; skipping", store_path.name, sorted(missing))
+            continue
+
+        weights = compute_sampling_weights(
+            np.asarray(group["stl_coordinates"][:]),
+            np.asarray(group["stl_faces"][:]),
+            np.asarray(group["surface_mesh_centers"][:]),
+            sampling_cfg,
+        )
+        chunks = _compute_chunks(weights.shape, weights.dtype.itemsize, 8.0)
+        if "sampling_weight" in keys:
+            del group["sampling_weight"]
+        group.create_array("sampling_weight", data=weights, chunks=chunks)
+        group.attrs["sampling_weight_cfg"] = {
+            k: float(v) for k, v in sampling_cfg.items()
+        }
+        updated += 1
+    logger.info("Backfilled sampling_weight into %d store(s)", updated)
+    return updated
 
 
 # --------------------------------------------------------------------------- #
@@ -713,6 +940,9 @@ class ConvertOptions:
     global_attrs: dict[str, dict[str, float]] | None = None  # sample_name -> {key: value}
     timings: bool = False
     verbose: bool = False
+    # Precompute per-point importance weights from STL curvature / feature edges
+    # and store them as ``sampling_weight``. ``None`` disables the feature.
+    sampling_cfg: dict | None = None
 
     # Global (parametric) scalar handling:
     # Emit the DoMINO-style ``global_params_values`` / ``global_params_reference``
@@ -775,6 +1005,7 @@ def _process_sample(sample: Sample, opts: ConvertOptions) -> tuple[str, str, str
             volume_location=opts.volume_location,
             synth_stl=opts.synth_stl,
             timings=opts.timings,
+            sampling_cfg=opts.sampling_cfg,
         )
         # Resolve per-sample global scalars.  Source precedence (only the CSV
         # path is enabled by default):
@@ -1007,7 +1238,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     batch.add_argument("--limit", type=int, default=None, help="Process at most N samples")
 
-    parser.add_argument("--output-dir", type=Path, required=True, help="Directory for .zarr output")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for .zarr output (not required with --backfill-sampling-weights)",
+    )
 
     fields = parser.add_argument_group("field selection")
     fields.add_argument(
@@ -1136,6 +1372,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.set_defaults(split_enabled=True)
 
+    sampling = parser.add_argument_group("importance-sampling weights")
+    sampling.add_argument(
+        "--sampling-weights",
+        action="store_true",
+        help=(
+            "Precompute a per-surface-point 'sampling_weight' array from STL "
+            "curvature / feature edges (for biased dynamic-graph subsampling)"
+        ),
+    )
+    sampling.add_argument(
+        "--backfill-sampling-weights",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Add 'sampling_weight' to already-converted .zarr store(s) at PATH "
+            "(a single store or a directory tree) and exit. Uses --overwrite to "
+            "replace existing weights."
+        ),
+    )
+    sampling.add_argument("--curvature-weight", type=float, default=SAMPLING_WEIGHT_DEFAULTS["curvature_weight"])
+    sampling.add_argument("--curvature-exponent", type=float, default=SAMPLING_WEIGHT_DEFAULTS["curvature_exponent"])
+    sampling.add_argument("--curvature-clip-percentile", type=float, default=SAMPLING_WEIGHT_DEFAULTS["curvature_clip_percentile"])
+    sampling.add_argument("--curvature-smoothing-iterations", type=int, default=int(SAMPLING_WEIGHT_DEFAULTS["curvature_smoothing_iterations"]))
+    sampling.add_argument("--feature-edge-weight", type=float, default=SAMPLING_WEIGHT_DEFAULTS["feature_edge_weight"])
+    sampling.add_argument("--feature-edge-angle", type=float, default=SAMPLING_WEIGHT_DEFAULTS["feature_edge_angle"])
+    sampling.add_argument("--feature-edge-falloff", type=float, default=SAMPLING_WEIGHT_DEFAULTS["feature_edge_falloff"])
+    sampling.add_argument("--density-exponent", type=float, default=SAMPLING_WEIGHT_DEFAULTS["density_exponent"])
+    sampling.add_argument("--min-weight", type=float, default=SAMPLING_WEIGHT_DEFAULTS["min_weight"])
+
     perf = parser.add_argument_group("performance")
     perf.add_argument(
         "-j",
@@ -1187,12 +1453,39 @@ def _resolve_samples(args: argparse.Namespace) -> list[Sample]:
     return samples
 
 
+def _sampling_cfg_from_args(args: argparse.Namespace) -> dict:
+    """Assemble the importance-sampling weight config from CLI args."""
+    return {
+        "curvature_weight": args.curvature_weight,
+        "curvature_exponent": args.curvature_exponent,
+        "curvature_clip_percentile": args.curvature_clip_percentile,
+        "curvature_smoothing_iterations": args.curvature_smoothing_iterations,
+        "feature_edge_weight": args.feature_edge_weight,
+        "feature_edge_angle": args.feature_edge_angle,
+        "feature_edge_falloff": args.feature_edge_falloff,
+        "density_exponent": args.density_exponent,
+        "min_weight": args.min_weight,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(message)s",
     )
+
+    # Backfill mode: add sampling_weight to existing stores and exit.
+    if args.backfill_sampling_weights is not None:
+        updated = backfill_sampling_weights(
+            args.backfill_sampling_weights,
+            _sampling_cfg_from_args(args),
+            overwrite=args.overwrite,
+        )
+        return 0 if updated > 0 else 1
+
+    if args.output_dir is None:
+        raise SystemExit("--output-dir is required (except with --backfill-sampling-weights).")
 
     surface_specs = parse_field_selection(args.surface_fields, DEFAULT_SURFACE_FIELDS)
     volume_specs = parse_field_selection(args.volume_fields, DEFAULT_VOLUME_FIELDS)
@@ -1246,6 +1539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         emit_global_params=args.emit_global_params,
         global_param_order=global_param_order,
         global_param_references=global_param_references,
+        sampling_cfg=_sampling_cfg_from_args(args) if args.sampling_weights else None,
     )
 
     jobs = max(1, args.jobs) if args.jobs else 1
