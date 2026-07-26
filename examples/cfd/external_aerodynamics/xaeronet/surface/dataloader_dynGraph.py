@@ -146,6 +146,14 @@ def load_raw_surface_sample(
         "shear_stress": fields[:, s_lo:s_hi],
     }
 
+    # Optional precomputed per-point importance weights for biased subsampling
+    # (e.g. curvature / feature-edge weighting). Kept aligned with the point
+    # subsample; the builder uses it for a weighted draw and never normalizes it.
+    if "sampling_weight" in set(group.array_keys()):
+        raw["sampling_weight"] = np.asarray(
+            group["sampling_weight"][sel], dtype=np.float32
+        ).reshape(-1)
+
     global_features = _read_global_features(group)
     if global_features is not None:
         raw["global_features"] = global_features

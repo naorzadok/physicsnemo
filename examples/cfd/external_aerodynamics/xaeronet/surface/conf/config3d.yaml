@@ -66,6 +66,8 @@ zarr_train_path: /workspace/drivaer_zarr/train      # Dir of training *.zarr sto
 zarr_valid_path: /workspace/drivaer_zarr/val        # Dir of validation *.zarr stores
 num_sampled_nodes: 100000                           # Points subsampled per cloud on the CPU worker (null = keep all)
 num_dataloader_workers: 4                           # DataLoader workers for the raw-Zarr loader
+no_partition: false                                 # true -> whole geometry as a single graph (no spatial partitioning)
+use_multiresolution: false                          # true -> multi-resolution sampling using num_nodes levels (cumulative kNN, long-range edges)
 
 stats_file: global_stats.json                       # Path to the global statistics (.json file)
 checkpoint_filename: model_checkpoint.pth           # Filename of the model checkpoint

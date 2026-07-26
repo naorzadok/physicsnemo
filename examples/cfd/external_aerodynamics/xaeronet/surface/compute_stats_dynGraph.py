@@ -53,7 +53,7 @@ from dataloader_dynGraph import (
     load_raw_surface_sample,
     surface_point_count,
 )
-from dynamic_graph_datapipe import build_knn_graph
+from dynamic_graph_datapipe import build_knn_graph, build_multilevel_knn_graph
 
 
 class RunningStats:
@@ -94,10 +94,22 @@ def compute_stats(
     node_degree: int,
     num_sampled_nodes: int | None,
     device: torch.device,
+    level_sizes: list[int] | None = None,
 ) -> tuple[dict, dict]:
-    """Accumulate node, edge and global statistics across all stores."""
+    """Accumulate node, edge and global statistics across all stores.
+
+    When ``level_sizes`` is given the edge (``"x"``) statistics are gathered from
+    a multi-resolution kNN graph (matching ``DynamicGraphBuilder``), so the
+    normalization sees the same long-range edge distribution used at train time.
+    """
     fields = list(NODE_FIELDS) + ["x", "global_features"]
     stats = {f: RunningStats() for f in fields}
+
+    # Number of nodes drawn for the edge-statistics subsample.
+    if level_sizes is not None:
+        edge_sample = int(sum(level_sizes))
+    else:
+        edge_sample = num_sampled_nodes
 
     for store in tqdm(stores, desc="Computing stats", unit="sample"):
         # Node-field statistics over the full cloud.
@@ -112,17 +124,20 @@ def compute_stats(
         # Edge-feature statistics from a kNN graph built on a raw subsample,
         # matching DynamicGraphBuilder (edges are built from raw coordinates).
         n = surface_point_count(store)
-        if num_sampled_nodes is not None and num_sampled_nodes < n:
-            sel = np.random.default_rng(0).choice(
-                n, size=num_sampled_nodes, replace=False
-            )
+        if edge_sample is not None and edge_sample < n:
+            sel = np.random.default_rng(0).choice(n, size=edge_sample, replace=False)
             sel.sort()
             coords = raw["coordinates"][sel]
         else:
             coords = raw["coordinates"]
 
         coords_t = torch.as_tensor(coords, dtype=torch.float32, device=device)
-        _, edge_attr = build_knn_graph(coords_t, node_degree)
+        if level_sizes is not None:
+            _, edge_attr = build_multilevel_knn_graph(
+                coords_t, level_sizes, node_degree
+            )
+        else:
+            _, edge_attr = build_knn_graph(coords_t, node_degree)
         stats["x"].update(edge_attr.detach().cpu().numpy())
 
     mean: dict = {}
@@ -156,11 +171,15 @@ def main(cfg: DictConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Computing statistics from {len(stores)} store(s) on {device}")
 
+    # Multi-resolution level sizes (edge stats must match the training graph).
+    level_sizes = list(cfg.num_nodes) if cfg.get("use_multiresolution", False) else None
+
     mean, std = compute_stats(
         stores,
         node_degree=cfg.node_degree,
         num_sampled_nodes=cfg.get("num_sampled_nodes", None),
         device=device,
+        level_sizes=level_sizes,
     )
 
     output_file = to_absolute_path(cfg.stats_file)

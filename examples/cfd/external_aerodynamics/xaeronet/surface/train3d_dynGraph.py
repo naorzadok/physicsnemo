@@ -120,11 +120,17 @@ def main(cfg: DictConfig) -> None:
     # GPU-side graph builder shared by train/val. Subsampling already happened on
     # the CPU worker, so the builder keeps every transferred node
     # (num_target_nodes=None) and only builds connectivity + normalizes.
+    #   - use_multiresolution: draw cumulative resolution levels (cfg.num_nodes)
+    #     and connect them with multi-scale kNN (adds long-range edges).
+    #   - no_partition: emit the whole geometry as a single graph.
+    level_sizes = list(cfg.num_nodes) if cfg.get("use_multiresolution", False) else None
+    num_partitions_eff = 1 if cfg.get("no_partition", False) else cfg.num_partitions
     graph_builder = DynamicGraphBuilder(
         node_degree=cfg.node_degree,
-        num_partitions=cfg.num_partitions,
+        num_partitions=num_partitions_eff,
         halo_hops=cfg.num_message_passing_layers,
         num_target_nodes=None,
+        level_sizes=level_sizes,
         mean=mean,
         std=std,
     )

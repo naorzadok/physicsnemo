@@ -133,6 +133,89 @@ def _to_undirected_coalesce(edge_index: torch.Tensor, num_nodes: int) -> torch.T
     return torch.stack([src_u, dst_u], dim=0)
 
 
+def _edge_attr_from_index(
+    coords: torch.Tensor, edge_index: torch.Tensor
+) -> torch.Tensor:
+    """Relative displacement (3) + displacement norm (1) for each edge."""
+    row, col = edge_index
+    disp = coords[row] - coords[col]
+    disp_norm = torch.linalg.norm(disp, dim=-1, keepdim=True)
+    return torch.cat((disp, disp_norm), dim=-1)
+
+
+def build_multilevel_knn_graph(
+    coords: torch.Tensor, level_sizes: list[int], k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Multi-resolution kNN graph reproducing the offline preprocessor's scheme.
+
+    ``coords`` must be ordered so that its nested prefixes are the resolution
+    levels: level 1 is ``coords[:level_sizes[0]]``, level 2 adds the next
+    ``level_sizes[1]`` points, and so on. A kNN graph is built independently on
+    each *cumulative* prefix and the edge sets are unioned. Because the coarse
+    prefixes are sparse over the whole geometry, their kNN edges span long
+    distances, while finer prefixes add local detail — giving the multi-scale
+    connectivity (long-range coupling) that lets the GNN model global physics.
+
+    Everything runs on-device (``physicsnemo.nn.functional.knn`` + a linear-index
+    union), so it preserves GPU acceleration. Equivalent to ``build_knn_graph``
+    when ``level_sizes`` has a single entry covering the whole cloud.
+    """
+    n = coords.shape[0]
+    srcs: list[torch.Tensor] = []
+    dsts: list[torch.Tensor] = []
+
+    cum = 0
+    for size in level_sizes:
+        cum = min(cum + int(size), n)
+        if cum <= 1:
+            continue
+        sub = coords[:cum]
+        kk = min(k + 1, cum)  # cannot ask for more neighbors than points
+        indices, _ = knn(sub, sub, kk)
+        deg = indices.shape[1] - 1  # neighbors excluding the self column
+        dst = indices[:, 1:].reshape(-1)
+        src = torch.arange(cum, device=coords.device).repeat_interleave(deg)
+        srcs.append(src)
+        dsts.append(dst)
+        if cum >= n:
+            break
+
+    edge_index = torch.stack([torch.cat(srcs), torch.cat(dsts)], dim=0)
+    edge_index = _to_undirected_coalesce(edge_index, n)
+    edge_attr = _edge_attr_from_index(coords, edge_index)
+    return edge_index, edge_attr
+
+
+def single_graph(
+    coords: torch.Tensor,
+    edge_index: torch.Tensor,
+    edge_attr: torch.Tensor,
+    node_fields: dict[str, torch.Tensor],
+    global_features: torch.Tensor | None = None,
+) -> list[pyg.data.Data]:
+    """Wrap the whole geometry as one un-partitioned ``pyg.data.Data``.
+
+    Returned as a single-element list so it is drop-in compatible with the
+    partitioned path in ``train3d``: ``inner_node`` and ``part_node`` are the
+    full identity range, so every node is "owned" and predictions scatter back
+    directly. Use when ``num_partitions <= 1`` (whole geometry = one graph).
+    """
+    n = coords.shape[0]
+    ids = torch.arange(n, device=coords.device)
+    data = pyg.data.Data(
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        num_nodes=n,
+        part_node=ids,
+        inner_node=ids,
+    )
+    for name in NODE_FIELDS:
+        setattr(data, name, node_fields[name])
+    if global_features is not None:
+        data.global_features = global_features
+    return [data]
+
+
 # --------------------------------------------------------------------------- #
 # 4. Spatial partitioning with halo (replaces offline METIS)
 # --------------------------------------------------------------------------- #
@@ -273,17 +356,35 @@ class DynamicGraphBuilder:
     ----------
     node_degree, num_partitions, halo_hops
         Graph-construction knobs mirroring the offline preprocessor / config.
+        ``num_partitions <= 1`` disables partitioning and emits the whole
+        geometry as a single graph (halo growth is then skipped).
     num_target_nodes
         Number of nodes to subsample from the raw cloud before building the
-        graph. Set to ``None`` (or a value ``>=`` the cloud size) to use every
-        node as-is — e.g. when the DataLoader already subsampled on the CPU to
-        minimize the host->device transfer.
+        graph (single-resolution path). Set to ``None`` (or a value ``>=`` the
+        cloud size) to use every node as-is — e.g. when the DataLoader already
+        subsampled on the CPU to minimize the host->device transfer. Ignored
+        when ``level_sizes`` is given.
+    level_sizes
+        Optional list of per-level point counts (e.g. ``[10000, 20000, 40000]``)
+        enabling multi-resolution sampling: ``sum(level_sizes)`` nodes are drawn
+        and connected with cumulative kNN (see ``build_multilevel_knn_graph``),
+        adding long-range edges across resolutions. ``None`` keeps the
+        single-resolution kNN graph.
     mean, std
         Optional statistics dicts (e.g. loaded from ``global_stats.json``),
         keyed by the entries of ``NODE_FIELDS`` plus ``"x"`` for edge features
         and, optionally, ``"global_features"``. Values may be
         lists/arrays/tensors; they are converted and cached to the input device
         on first use. When ``None``, no normalization is applied.
+
+    Notes
+    -----
+    Importance sampling: if the raw sample carries a per-point ``sampling_weight``
+    vector, node selection uses a weighted draw (``torch.multinomial``) instead
+    of a uniform permutation, so high-importance points (e.g. high-curvature /
+    feature-edge regions) are sampled more densely. The weights themselves are
+    expected to be *precomputed* (stored alongside the raw cloud); computing
+    mesh curvature on the fly would be CPU-bound and defeat the GPU pipeline.
     """
 
     def __init__(
@@ -292,11 +393,13 @@ class DynamicGraphBuilder:
         num_partitions: int,
         halo_hops: int,
         num_target_nodes: int | None = None,
+        level_sizes: list[int] | None = None,
         mean: dict | None = None,
         std: dict | None = None,
     ):
         self.node_degree = node_degree
         self.num_target_nodes = num_target_nodes
+        self.level_sizes = list(level_sizes) if level_sizes else None
         self.num_partitions = num_partitions
         self.halo_hops = halo_hops
         self._mean_src = mean
@@ -321,6 +424,32 @@ class DynamicGraphBuilder:
             for k in keys
         }
 
+    def _select_indices(
+        self,
+        num_source: int,
+        total: int,
+        weights: torch.Tensor | None,
+        generator: torch.Generator | None,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Pick ``total`` node ids, importance-weighted when weights are given.
+
+        With ``weights`` present, a ``multinomial`` draw (without replacement)
+        biases selection toward high-weight points. Otherwise falls back to a
+        uniform permutation. When ``total >= num_source`` and no weights are
+        given, every node is kept (identity order).
+        """
+        if weights is not None:
+            w = weights.to(device=device, dtype=torch.float32).reshape(-1)
+            w = torch.clamp(w, min=0.0)
+            total = min(total, int((w > 0).sum().item()))
+            return torch.multinomial(
+                w, total, replacement=False, generator=generator
+            )
+        if total >= num_source:
+            return torch.arange(num_source, device=device)
+        return subsample_nodes(num_source, total, generator=generator, device=device)
+
     def __call__(
         self,
         raw: dict[str, torch.Tensor],
@@ -329,20 +458,31 @@ class DynamicGraphBuilder:
         device = raw["coordinates"].device
         self._stats_on(device)
 
-        # Subsample nodes (per-step dynamics). Skipped when num_target_nodes is
-        # None or the cloud is already at/below the target (e.g. CPU-subsampled).
         num_source = raw["coordinates"].shape[0]
-        if self.num_target_nodes is None or self.num_target_nodes >= num_source:
-            idx = torch.arange(num_source, device=device)
+        weights = raw.get("sampling_weight")
+
+        # How many nodes to draw: multi-resolution sums the level sizes; the
+        # single-resolution path uses num_target_nodes (or the whole cloud).
+        if self.level_sizes is not None:
+            total = min(int(sum(self.level_sizes)), num_source)
+        elif self.num_target_nodes is not None and self.num_target_nodes < num_source:
+            total = self.num_target_nodes
         else:
-            idx = subsample_nodes(
-                num_source, self.num_target_nodes, generator=generator, device=device
-            )
+            total = num_source
+
+        # Subsample nodes (per-step dynamics), importance-weighted if available.
+        idx = self._select_indices(num_source, total, weights, generator, device)
 
         # Build connectivity + edge features from RAW coordinates (normalization
-        # is anisotropic and would change the neighbor set).
+        # is anisotropic and would change the neighbor set). Multi-resolution
+        # relies on the draw order: the nested prefixes of idx are the levels.
         coords_raw = raw["coordinates"][idx]
-        edge_index, edge_attr = build_knn_graph(coords_raw, self.node_degree)
+        if self.level_sizes is not None:
+            edge_index, edge_attr = build_multilevel_knn_graph(
+                coords_raw, self.level_sizes, self.node_degree
+            )
+        else:
+            edge_index, edge_attr = build_knn_graph(coords_raw, self.node_degree)
 
         # Normalize node fields and edge features on-device.
         node_fields: dict[str, torch.Tensor] = {}
@@ -363,6 +503,16 @@ class DynamicGraphBuilder:
                 global_features = (
                     global_features - self._mean["global_features"]
                 ) / self._std["global_features"]
+
+        # No partitioning requested: emit the whole geometry as one graph.
+        if self.num_partitions is None or self.num_partitions <= 1:
+            return single_graph(
+                node_fields["coordinates"],
+                edge_index,
+                edge_attr,
+                node_fields,
+                global_features=global_features,
+            )
 
         # Partition using the (normalized) coordinates; the axis-sort split is
         # invariant to positive per-axis scaling, so this is equivalent to
