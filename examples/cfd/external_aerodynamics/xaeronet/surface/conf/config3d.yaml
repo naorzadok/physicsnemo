@@ -113,3 +113,5 @@ aero_coefficients:                                  # Integrate pre-normalized s
   output_frame: both                                # Coefficient frame(s) to report: "body", "wind" or "both"
   ref_area: 1.0                                     # Reference area for force coefficients (1.0 since fields are pre-normalized)
   ref_length: 1.0                                   # Reference length for moment coefficients
+  compute: true                                     # inference_dynGraph: integrate CL/CD/CM per sample + report R^2 / Normalized_fit_score
+  report_optional_coeffs: false                     # Also report side force (CY) and roll/yaw moments (Cl, Cn)

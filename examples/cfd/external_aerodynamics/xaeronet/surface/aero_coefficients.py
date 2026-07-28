@@ -140,6 +140,9 @@ class AerodynamicCoefficients:
     ref_length : float, optional
         Reference length used (together with ``ref_area``) to non-dimensionalize
         moments. Defaults to ``1.0``.
+    verbose : bool, optional
+        When ``True`` (default) each call prints a summary table. Set ``False``
+        to stay quiet when scoring many samples in a loop.
     """
 
     def __init__(
@@ -153,6 +156,7 @@ class AerodynamicCoefficients:
         output_frame="both",
         ref_area=1.0,
         ref_length=1.0,
+        verbose=True,
     ):
         self.mrc = np.asarray(mrc, dtype=np.float64).reshape(3)
         self.alpha = float(alpha)
@@ -167,6 +171,7 @@ class AerodynamicCoefficients:
         )
         self.ref_area = float(ref_area)
         self.ref_length = float(ref_length)
+        self.verbose = bool(verbose)
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -216,7 +221,8 @@ class AerodynamicCoefficients:
             coordinates, normals, area, pressure, shear_stress, config
         )
         results = self._assemble_results(integrals, config)
-        self._print_summary(results, config)
+        if self.verbose:
+            self._print_summary(results, config)
         return results
 
     def calculate_from_vtp(

@@ -454,7 +454,8 @@ class DynamicGraphBuilder:
         self,
         raw: dict[str, torch.Tensor],
         generator: torch.Generator | None = None,
-    ) -> list[pyg.data.Data]:
+        return_indices: bool = False,
+    ) -> list[pyg.data.Data] | tuple[list[pyg.data.Data], torch.Tensor]:
         device = raw["coordinates"].device
         self._stats_on(device)
 
@@ -506,24 +507,33 @@ class DynamicGraphBuilder:
 
         # No partitioning requested: emit the whole geometry as one graph.
         if self.num_partitions is None or self.num_partitions <= 1:
-            return single_graph(
+            partitions = single_graph(
                 node_fields["coordinates"],
                 edge_index,
                 edge_attr,
                 node_fields,
                 global_features=global_features,
             )
+        else:
+            # Partition using the (normalized) coordinates; the axis-sort split is
+            # invariant to positive per-axis scaling, so this is equivalent to
+            # splitting on raw coords.
+            partitions = spatial_partition(
+                node_fields["coordinates"],
+                edge_index,
+                edge_attr,
+                node_fields,
+                self.num_partitions,
+                self.halo_hops,
+                global_features=global_features,
+            )
 
-        # Partition using the (normalized) coordinates; the axis-sort split is
-        # invariant to positive per-axis scaling, so this is equivalent to
-        # splitting on raw coords.
-        return spatial_partition(
-            node_fields["coordinates"],
-            edge_index,
-            edge_attr,
-            node_fields,
-            self.num_partitions,
-            self.halo_hops,
-            global_features=global_features,
-        )
+        # ``idx`` maps every drawn node (in draw / part_node order) back to its
+        # row in the raw cloud, letting callers recover per-point quantities
+        # (e.g. sampling_weight) that are not carried on the graph. With
+        # multi-resolution the finest level is the whole drawn set, so ``idx``
+        # also identifies the finest-level points used for coefficient integration.
+        if return_indices:
+            return partitions, idx
+        return partitions
 

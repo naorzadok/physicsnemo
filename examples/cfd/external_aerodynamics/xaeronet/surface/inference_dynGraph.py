@@ -53,6 +53,7 @@ import hydra
 import numpy as np
 import pyvista as pv
 import torch
+import zarr
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 from tabulate import tabulate
@@ -63,6 +64,7 @@ from physicsnemo.models.meshgraphnet import MeshGraphNet
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
 
+from aero_coefficients import AerodynamicCoefficients
 from dataloader_dynGraph import (
     find_zarr_stores,
     load_raw_surface_sample,
@@ -70,6 +72,11 @@ from dataloader_dynGraph import (
 )
 from dynamic_graph_datapipe import DynamicGraphBuilder
 from utils import count_trainable_params
+
+# Aerodynamic coefficients reported by default (wind-frame). CM is the pitching
+# moment (``Cm``); the roll/yaw moments and side force are optional extras.
+DEFAULT_COEFFICIENTS = {"CD": "CD", "CL": "CL", "CM": "Cm"}
+OPTIONAL_COEFFICIENTS = {"CY": "CY", "Cl": "Cl", "Cn": "Cn"}
 
 
 def remove_module_prefix(state_dict: dict) -> dict:
@@ -135,9 +142,11 @@ def predict_sample(
     Returns a dict of ``(M, C)`` tensors (``M`` = number of drawn/owned nodes)
     on the CPU: ``pressure_pred``, ``shear_stress_pred``, ``pressure_true``,
     ``shear_stress_true``, ``coordinates``, ``normals``, ``area`` -- all still
-    normalized (denormalization happens in the caller).
+    normalized (denormalization happens in the caller). When the store carries
+    importance weights, ``sampling_weight`` is also returned (aligned, raw, not
+    normalized) for the inverse-density area correction used by the coefficients.
     """
-    partitions = graph_builder(raw, generator=generator)
+    partitions, idx = graph_builder(raw, generator=generator, return_indices=True)
 
     ids_parts: list[torch.Tensor] = []
     pred_parts: list[torch.Tensor] = []
@@ -172,7 +181,7 @@ def predict_sample(
 
     pred_full = _scatter(pred_parts, 4)
     true_full = _scatter(true_parts, 4)
-    return {
+    result = {
         "pressure_pred": pred_full[:, :1],
         "shear_stress_pred": pred_full[:, 1:],
         "pressure_true": true_full[:, :1],
@@ -181,6 +190,13 @@ def predict_sample(
         "normals": _scatter(normal_parts, 3),
         "area": _scatter(area_parts, 1),
     }
+
+    # Per-point importance weight, aligned with the scattered fields (output
+    # position ``j`` corresponds to drawn index ``j`` = raw row ``idx[j]``).
+    weight = raw.get("sampling_weight")
+    if weight is not None:
+        result["sampling_weight"] = weight[idx].reshape(-1, 1).float().cpu()[:total]
+    return result
 
 
 def denormalize(
@@ -198,8 +214,11 @@ def denormalize(
         "normals": "normals",
         "area": "area",
     }
+    # Keys without a stats entry (e.g. ``sampling_weight``) pass through as-is.
     return {
-        name: value * std[key_of[name]] + mean[key_of[name]]
+        name: (value * std[key_of[name]] + mean[key_of[name]])
+        if name in key_of
+        else value
         for name, value in fields.items()
     }
 
@@ -216,6 +235,98 @@ def save_point_cloud(fields: dict[str, torch.Tensor], path: str) -> None:
     cloud["pressure_true"] = fields["pressure_true"].numpy()
     cloud["shear_stress_true"] = fields["shear_stress_true"].numpy()
     cloud.save(path)
+
+
+def total_surface_area(store_path: str) -> float:
+    """Sum the per-cell surface areas of the full store (not the subsample)."""
+    group = zarr.open_group(store_path, mode="r")
+    return float(np.asarray(group["surface_areas"][:], dtype=np.float64).sum())
+
+
+def _make_calculator(aero_cfg: DictConfig) -> AerodynamicCoefficients:
+    """Build a wind-frame coefficient calculator from the config block."""
+    return AerodynamicCoefficients(
+        mrc=list(aero_cfg.get("mrc", [0.0, 0.0, 0.0])),
+        alpha=float(aero_cfg.get("alpha", 0.0)),
+        beta=float(aero_cfg.get("beta", 0.0)),
+        alpha_total=float(aero_cfg.get("alpha_total", 0.0)),
+        phi_aerodynamic=float(aero_cfg.get("phi_aerodynamic", 0.0)),
+        convention=str(aero_cfg.get("convention", "alpha_beta")),
+        output_frame="wind",
+        ref_area=float(aero_cfg.get("ref_area", 1.0)),
+        ref_length=float(aero_cfg.get("ref_length", 1.0)),
+        verbose=False,
+    )
+
+
+def compute_coefficients(
+    fields: dict[str, torch.Tensor],
+    total_area: float,
+    calculator: AerodynamicCoefficients,
+    include_optional: bool,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Integrate wind-frame coefficients over all finest-level points.
+
+    Uses inverse-density (Horvitz-Thompson) area weighting when importance
+    weights are present, then rescales the effective areas so they sum to the
+    store's true total surface area. Returns ``(pred_coeffs, true_coeffs)``
+    keyed by the reported coefficient names (CD, CL, CM [+ CY, Cl, Cn]).
+    """
+    area = fields["area"].numpy().reshape(-1, 1).astype(np.float64)
+    weight = fields.get("sampling_weight")
+    if weight is not None:
+        w = weight.numpy().reshape(-1, 1).astype(np.float64)
+        area_eff = area / np.clip(w, 1e-12, None)
+    else:
+        area_eff = area
+    area_sum = area_eff.sum()
+    if area_sum > 0:
+        area_eff = area_eff * (total_area / area_sum)
+
+    coords = fields["coordinates"].numpy().astype(np.float64)
+    normals = fields["normals"].numpy().astype(np.float64)
+
+    keys = dict(DEFAULT_COEFFICIENTS)
+    if include_optional:
+        keys.update(OPTIONAL_COEFFICIENTS)
+
+    def _coeffs(pressure: torch.Tensor, shear: torch.Tensor) -> dict[str, float]:
+        data = {
+            "coordinates": coords,
+            "normals": normals,
+            "area": area_eff,
+            "pressure": pressure.numpy().astype(np.float64),
+            "shear_stress": shear.numpy().astype(np.float64),
+        }
+        res = calculator.calculate_from_dict(data)
+        c = res["wind_frame"]["coefficients"]
+        return {name: float(c[src]) for name, src in keys.items()}
+
+    pred = _coeffs(fields["pressure_pred"], fields["shear_stress_pred"])
+    true = _coeffs(fields["pressure_true"], fields["shear_stress_true"])
+    return pred, true
+
+
+def r2_score(pred: np.ndarray, true: np.ndarray) -> float:
+    """Coefficient of determination across samples (nan if < 2 samples)."""
+    pred = np.asarray(pred, dtype=np.float64)
+    true = np.asarray(true, dtype=np.float64)
+    ss_tot = float(np.sum((true - true.mean()) ** 2))
+    if pred.size < 2 or ss_tot == 0.0:
+        return float("nan")
+    ss_res = float(np.sum((true - pred) ** 2))
+    return 1.0 - ss_res / ss_tot
+
+
+def normalized_fit_score(pred: np.ndarray, true: np.ndarray) -> float:
+    """1 - RMSE / std(true) across samples (nan if < 2 samples or flat true)."""
+    pred = np.asarray(pred, dtype=np.float64)
+    true = np.asarray(true, dtype=np.float64)
+    sd = float(np.std(true))
+    if pred.size < 2 or sd == 0.0:
+        return float("nan")
+    rmse = float(np.sqrt(np.mean((pred - true) ** 2)))
+    return 1.0 - rmse / sd
 
 
 @hydra.main(version_base="1.3", config_path="conf", config_name="config3d")
@@ -275,8 +386,18 @@ def main(cfg: DictConfig) -> None:
     num_sampled_nodes = cfg.get("num_sampled_nodes", None)
     save_clouds = cfg.get("save_inference_clouds", True)
 
+    # Aerodynamic-coefficient scoring configuration.
+    aero_cfg = cfg.get("aero_coefficients", {})
+    compute_aero = bool(aero_cfg.get("compute", True)) if aero_cfg else False
+    include_optional = bool(aero_cfg.get("report_optional_coeffs", False))
+    aero_calc = _make_calculator(aero_cfg) if compute_aero else None
+    coeff_names = list(DEFAULT_COEFFICIENTS)
+    if include_optional:
+        coeff_names += list(OPTIONAL_COEFFICIENTS)
+
     # Per-sample relative errors, aggregated at the end.
     metric_rows: list[dict[str, float]] = []
+    coeff_rows: list[dict[str, object]] = []
 
     for store_path in stores:
         # Seed per sample so the draw is reproducible yet varies across samples.
@@ -328,6 +449,26 @@ def main(cfg: DictConfig) -> None:
         print(f"\nRelative errors for {run_id} ({row['num_nodes']} nodes):\n")
         print(tabulate(table, headers=["Quantity", "L2", "L1"], tablefmt="github"))
 
+        # Aerodynamic coefficients integrated over the finest-level points.
+        if compute_aero:
+            pred_c, true_c = compute_coefficients(
+                fields, total_surface_area(store_path), aero_calc, include_optional
+            )
+            coeff_rows.append({"id": run_id, "pred": pred_c, "true": true_c})
+            ctable = [
+                [name, f"{pred_c[name]:.5f}", f"{true_c[name]:.5f}",
+                 f"{pred_c[name] - true_c[name]:+.5f}"]
+                for name in coeff_names
+            ]
+            print(f"\nAerodynamic coefficients for {run_id}:\n")
+            print(
+                tabulate(
+                    ctable,
+                    headers=["Coeff", "Predicted", "True", "Error"],
+                    tablefmt="github",
+                )
+            )
+
         if save_clouds:
             out_path = f"inference_cloud_{run_id}.vtp"
             save_point_cloud(fields, out_path)
@@ -351,9 +492,45 @@ def main(cfg: DictConfig) -> None:
         )
     )
 
+    # Aerodynamic-coefficient fit metrics across all samples (R^2 and the
+    # normalized fit score 1 - RMSE/std). These need >= 2 samples to be
+    # meaningful; with fewer they degrade gracefully to NaN.
+    coeff_metrics: dict[str, dict[str, float]] = {}
+    if compute_aero and coeff_rows:
+        fit_table = []
+        for name in coeff_names:
+            pred = np.array([r["pred"][name] for r in coeff_rows])
+            true = np.array([r["true"][name] for r in coeff_rows])
+            r2 = r2_score(pred, true)
+            fit = normalized_fit_score(pred, true)
+            mae = float(np.mean(np.abs(pred - true)))
+            coeff_metrics[name] = {"R2": r2, "Normalized_fit_score": fit, "MAE": mae}
+            fit_table.append([name, f"{r2:.4f}", f"{fit:.4f}", f"{mae:.5f}"])
+        print(
+            f"\nAerodynamic-coefficient fit across {len(coeff_rows)} sample(s):\n"
+        )
+        print(
+            tabulate(
+                fit_table,
+                headers=["Coeff", "R^2", "Normalized_fit_score", "MAE"],
+                tablefmt="github",
+            )
+        )
+        if len(coeff_rows) < 2:
+            print(
+                "Note: R^2 / Normalized_fit_score require >= 2 samples; "
+                "reported as NaN for a single sample."
+            )
+
     out_json = "inference_dynGraph_errors.json"
+    output = {"per_sample": metric_rows, "aggregate": aggregate}
+    if compute_aero and coeff_rows:
+        output["coefficients"] = {
+            "per_sample": coeff_rows,
+            "fit_metrics": coeff_metrics,
+        }
     with open(out_json, "w") as f:
-        json.dump({"per_sample": metric_rows, "aggregate": aggregate}, f, indent=2)
+        json.dump(output, f, indent=2)
     print(f"\nWrote {out_json}")
     print("Inference complete")
 
