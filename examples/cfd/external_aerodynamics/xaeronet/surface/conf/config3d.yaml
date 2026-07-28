@@ -64,6 +64,7 @@ test_partitions_path: test_partitions               # Path to the test partition
 # Dynamic (on-the-fly) graph pipeline: raw DoMINO surface Zarr stores.
 zarr_train_path: /workspace/drivaer_zarr/train      # Dir of training *.zarr stores
 zarr_valid_path: /workspace/drivaer_zarr/val        # Dir of validation *.zarr stores
+zarr_test_path: /workspace/drivaer_zarr/val         # Dir of test *.zarr stores for inference_dynGraph (defaults to the val dir)
 num_sampled_nodes: 100000                           # Points subsampled per cloud on the CPU worker (null = keep all)
 num_dataloader_workers: 4                           # DataLoader workers for the raw-Zarr loader
 no_partition: false                                 # true -> whole geometry as a single graph (no spatial partitioning)
@@ -75,6 +76,13 @@ start_lr: 0.001                                     # Initial learning rate (cos
 end_lr: 0.000001                                    # Final learning rate (cos annealing schedule is used)
 save_checkpoint_freq: 5                             # Frequency of saving the model checkpoint
 validation_freq: 50                                 # Frequency of validation
+
+# ┌───────────────────────────────────────────┐
+# │          Inference (dynamic graph)        │
+# └───────────────────────────────────────────┘
+
+inference_seed: 0                                   # Seed for the reproducible graph-build draw in inference_dynGraph
+save_inference_clouds: true                         # Save a per-sample prediction point cloud (.vtp)
 
 # ┌───────────────────────────────────────────┐
 # │        Performance Optimization           │
