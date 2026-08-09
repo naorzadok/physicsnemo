@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Adds `physicsnemo.models.meshgraphnet.FiLMMeshGraphNet`, a MeshGraphNet
+  variant that conditions the message-passing processor on global parameters
+  (e.g. Reynolds number, Mach number, angle of attack) via per-layer
+  Feature-wise Linear Modulation (FiLM). The FiLM heads are zero-initialized, so
+  at initialization the model reproduces the parent `MeshGraphNet`, making it a
+  drop-in, warm-startable extension. The accompanying
+  `FiLMMeshGraphNetProcessor` adds an optional, backward-compatible `modulation`
+  argument to the processor forward and preserves gradient checkpointing.
 - Promotes GeoTransolver out of `experimental` to
   `physicsnemo.models.geotransolver.GeoTransolver`, together with the FLARE
   model (`physicsnemo.models.flare.FLARE`) and the reusable GALE and FLARE

@@ -11,6 +11,16 @@ Graph Neural Networks
     :members:
     :exclude-members: forward
 
+.. autoclass:: physicsnemo.models.meshgraphnet.film_meshgraphnet.FiLMMeshGraphNet
+    :show-inheritance:
+    :members:
+    :exclude-members: forward
+
+.. autoclass:: physicsnemo.models.meshgraphnet.film_meshgraphnet.FiLMMeshGraphNetProcessor
+    :show-inheritance:
+    :members:
+    :exclude-members: forward
+
 .. autoclass:: physicsnemo.models.mesh_reduced.mesh_reduced.Mesh_Reduced
     :show-inheritance:
     :members:
