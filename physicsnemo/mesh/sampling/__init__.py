@@ -18,10 +18,15 @@
 
 This module provides functions for sampling points on meshes, including:
 - Random uniform point sampling on cells using Dirichlet distributions
+- Geometry-aware importance sampling weighted by surface curvature
 - Spatial data sampling at query points with interpolation
 - BVH-accelerated sampling for large meshes (via the ``bvh`` parameter)
 """
 
+from physicsnemo.mesh.sampling.importance_sampling import (
+    compute_curvature_sampling_weights,
+    sample_cells_by_weight,
+)
 from physicsnemo.mesh.sampling.random_point_sampling import (
     sample_random_points_on_cells,
 )
