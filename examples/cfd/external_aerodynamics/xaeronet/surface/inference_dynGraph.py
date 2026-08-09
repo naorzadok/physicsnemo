@@ -70,8 +70,9 @@ from dataloader_dynGraph import (
     load_raw_surface_sample,
     surface_point_count,
 )
-from dynamic_graph_datapipe import DynamicGraphBuilder
+from dynamic_graph_datapipe import DynamicGraphBuilder, resolve_level_ratios
 from utils import count_trainable_params
+from util_inference import generate_report, plot_pressure_error_heatmap
 
 # Aerodynamic coefficients reported by default (wind-frame). CM is the pitching
 # moment (``Cm``); the roll/yaw moments and side force are optional extras.
@@ -155,8 +156,14 @@ def predict_sample(
     normal_parts: list[torch.Tensor] = []
     area_parts: list[torch.Tensor] = []
 
+    # Graph-level (global) features are identical across partitions, so capture
+    # the normalized vector once for later denormalization / VTP export.
+    global_features: torch.Tensor | None = None
+
     for part in partitions:
         part = part.to(device)
+        if global_features is None and "global_features" in part:
+            global_features = part.global_features.detach().float().cpu()
         inner = part.inner_node
         ndata = node_features(part)
         with torch.autocast("cuda", enabled=True, dtype=amp_dtype):
@@ -190,6 +197,8 @@ def predict_sample(
         "normals": _scatter(normal_parts, 3),
         "area": _scatter(area_parts, 1),
     }
+    if global_features is not None:
+        result["global_features"] = global_features
 
     # Per-point importance weight, aligned with the scattered fields (output
     # position ``j`` corresponds to drawn index ``j`` = raw row ``idx[j]``).
@@ -213,6 +222,7 @@ def denormalize(
         "coordinates": "coordinates",
         "normals": "normals",
         "area": "area",
+        "global_features": "global_features",
     }
     # Keys without a stats entry (e.g. ``sampling_weight``) pass through as-is.
     return {
@@ -223,7 +233,11 @@ def denormalize(
     }
 
 
-def save_point_cloud(fields: dict[str, torch.Tensor], path: str) -> None:
+def save_point_cloud(
+    fields: dict[str, torch.Tensor],
+    path: str,
+    global_feature_names: list[str] | None = None,
+) -> None:
     """Write the denormalized predictions + ground truth to a ``.vtp``."""
     coords = fields["coordinates"].numpy()
     cloud = pv.PolyData(coords)
@@ -234,6 +248,17 @@ def save_point_cloud(fields: dict[str, torch.Tensor], path: str) -> None:
     cloud["shear_stress_pred"] = fields["shear_stress_pred"].numpy()
     cloud["pressure_true"] = fields["pressure_true"].numpy()
     cloud["shear_stress_true"] = fields["shear_stress_true"].numpy()
+
+    # Store the graph-level (global) features (e.g. alpha, beta, mach, reynolds)
+    # as VTP field data, one named array per feature, mirroring the training
+    # validation writer so downstream tools can read the flow conditions.
+    if "global_features" in fields:
+        values = fields["global_features"].reshape(-1).numpy().astype(np.float64)
+        names = list(global_feature_names or [])
+        for i, value in enumerate(values):
+            name = names[i] if i < len(names) else f"global_feature_{i}"
+            cloud.field_data[name] = np.asarray([value], dtype=np.float64)
+        cloud.field_data["global_features"] = values
     cloud.save(path)
 
 
@@ -367,10 +392,16 @@ def main(cfg: DictConfig) -> None:
     load_model_params(model, to_absolute_path(cfg.checkpoint_filename))
     model.eval()
 
-    # Graph builder configured identically to train3d_dynGraph: multi-resolution
-    # is auto-enabled when num_nodes lists more than one level, and partitioning
-    # is disabled when no_partition is set.
-    level_sizes = list(cfg.num_nodes) if len(cfg.num_nodes) > 1 else None
+    # Graph builder configured identically to train3d_dynGraph: scale-invariant
+    # multi-resolution via (num_levels, level_ratio) / level_ratios (falling back
+    # to the legacy absolute num_nodes list), and partitioning disabled when
+    # no_partition is set.
+    level_ratios = resolve_level_ratios(cfg)
+    level_sizes = (
+        None
+        if level_ratios is not None
+        else (list(cfg.num_nodes) if len(cfg.num_nodes) > 1 else None)
+    )
     num_partitions_eff = 1 if cfg.get("no_partition", False) else cfg.num_partitions
     graph_builder = DynamicGraphBuilder(
         node_degree=cfg.node_degree,
@@ -378,6 +409,7 @@ def main(cfg: DictConfig) -> None:
         halo_hops=cfg.num_message_passing_layers,
         num_target_nodes=None,
         level_sizes=level_sizes,
+        level_ratios=level_ratios,
         mean=stats["mean"],
         std=stats["std_dev"],
     )
@@ -394,6 +426,10 @@ def main(cfg: DictConfig) -> None:
     coeff_names = list(DEFAULT_COEFFICIENTS)
     if include_optional:
         coeff_names += list(OPTIONAL_COEFFICIENTS)
+
+    # Post-processing report + plots.
+    make_report = bool(cfg.get("make_inference_report", True))
+    global_feature_names = list(cfg.get("global_feature_names", []) or [])
 
     # Per-sample relative errors, aggregated at the end.
     metric_rows: list[dict[str, float]] = []
@@ -449,12 +485,27 @@ def main(cfg: DictConfig) -> None:
         print(f"\nRelative errors for {run_id} ({row['num_nodes']} nodes):\n")
         print(tabulate(table, headers=["Quantity", "L2", "L1"], tablefmt="github"))
 
+        # Denormalized graph-level (global) features for this sample, used to
+        # color the coefficient scatter and label the report.
+        global_values = (
+            fields["global_features"].reshape(-1).tolist()
+            if "global_features" in fields
+            else None
+        )
+
         # Aerodynamic coefficients integrated over the finest-level points.
         if compute_aero:
             pred_c, true_c = compute_coefficients(
                 fields, total_surface_area(store_path), aero_calc, include_optional
             )
-            coeff_rows.append({"id": run_id, "pred": pred_c, "true": true_c})
+            coeff_rows.append(
+                {
+                    "id": run_id,
+                    "pred": pred_c,
+                    "true": true_c,
+                    "global_features": global_values,
+                }
+            )
             ctable = [
                 [name, f"{pred_c[name]:.5f}", f"{true_c[name]:.5f}",
                  f"{pred_c[name] - true_c[name]:+.5f}"]
@@ -471,8 +522,19 @@ def main(cfg: DictConfig) -> None:
 
         if save_clouds:
             out_path = f"inference_cloud_{run_id}.vtp"
-            save_point_cloud(fields, out_path)
+            save_point_cloud(fields, out_path, global_feature_names)
             print(f"Saved {out_path}")
+
+        # Per-sample 2D pressure-error heatmap (X-Z side view).
+        if make_report:
+            heatmap_path = plot_pressure_error_heatmap(
+                fields["coordinates"].numpy(),
+                fields["pressure_pred"].numpy(),
+                fields["pressure_true"].numpy(),
+                out_path=f"error_heatmap_{run_id}.png",
+                run_id=run_id,
+            )
+            print(f"Saved {heatmap_path}")
 
     # Aggregate mean errors across all samples.
     metric_keys = [k for k in metric_rows[0] if k not in ("id", "num_nodes")]
@@ -532,6 +594,17 @@ def main(cfg: DictConfig) -> None:
     with open(out_json, "w") as f:
         json.dump(output, f, indent=2)
     print(f"\nWrote {out_json}")
+
+    # Aggregate coefficient metric report + true-vs-predicted scatter plot.
+    if make_report and compute_aero and coeff_rows:
+        generate_report(
+            coeff_rows,
+            coeff_names,
+            global_feature_names,
+            output_dir=".",
+            color_by=0,
+        )
+
     print("Inference complete")
 
 

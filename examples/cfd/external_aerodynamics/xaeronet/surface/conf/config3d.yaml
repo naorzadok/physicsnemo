@@ -25,7 +25,21 @@ hydra:
 # │            Data Preprocessing             │
 # └───────────────────────────────────────────┘
 
-num_nodes: [10000,20000,40000]                  # Nodes per resolution level; >1 entry auto-enables multi-resolution (cumulative kNN, long-range edges), a single entry uses a plain kNN graph
+# Multi-resolution graph levels.
+# Preferred (dynamic pipeline): scale-invariant spec as a number of levels plus a
+# geometric ratio. The finest level is a fraction of the *available* nodes (after
+# the CPU subsample below) and coarser levels are nested sub-fractions of it, so
+# the fine resolution never shrinks as coarse levels are added and the spec is
+# independent of each run's cell count.
+#   num_levels=3, level_ratio=0.5  ->  cumulative fractions [0.25, 0.5, 1.0]
+# For an explicit spec instead, set `level_ratios` (ascending cumulative
+# fractions in (0, 1], last is the finest), e.g. level_ratios: [0.25, 0.5, 1.0].
+# Priority: level_ratios > (num_levels, level_ratio) > legacy num_nodes.
+num_levels: 3                                        # Number of resolution levels (dynamic pipeline)
+level_ratio: 0.5                                     # Geometric ratio between consecutive levels
+# level_ratios: [0.25, 0.5, 1.0]                     # Optional explicit cumulative fractions (overrides num_levels)
+
+num_nodes: [10000,20000,40000]                       # Legacy absolute per-level counts; only used by the offline preprocessor and as a fallback when no ratios are set
 node_degree: 6                                       # Degree of the nodes in the graphs
 num_partitions: 3                                    # Number of partitions for each graph
 data_path: /workspace/examples/cfd/external_aerodynamics/xaeronet/surface/data_folders/drivaer_data       # Path to the raw data
@@ -65,7 +79,7 @@ test_partitions_path: test_partitions               # Path to the test partition
 zarr_train_path: /workspace/drivaer_zarr/train      # Dir of training *.zarr stores
 zarr_valid_path: /workspace/drivaer_zarr/val        # Dir of validation *.zarr stores
 zarr_test_path: /workspace/drivaer_zarr/val         # Dir of test *.zarr stores for inference_dynGraph (defaults to the val dir)
-num_sampled_nodes: 100000                           # Points subsampled per cloud on the CPU worker (null = keep all)
+num_sampled_nodes: 100000                           # Points subsampled per cloud on the CPU worker before H2D transfer (null = keep all). This is the finest-level node count: with level_ratio the levels are fractions of it (e.g. 100000 -> [25000, 50000, 100000]). Set this to sample fewer than the full cloud (e.g. 8.8M -> 100000).
 num_dataloader_workers: 4                           # DataLoader workers for the raw-Zarr loader
 no_partition: false                                 # true -> whole geometry as a single graph (no spatial partitioning)
 
@@ -83,6 +97,8 @@ validation_freq: 50                                 # Frequency of validation
 
 inference_seed: 0                                   # Seed for the reproducible graph-build draw in inference_dynGraph
 save_inference_clouds: true                         # Save a per-sample prediction point cloud (.vtp)
+make_inference_report: true                         # Write the coefficient metric report + scatter/heatmap plots (util_inference)
+global_feature_names: [alpha, beta, mach, reynolds] # Names of the per-sample global features; written to the VTP field data and used to label/color the report plots
 
 # ┌───────────────────────────────────────────┐
 # │        Performance Optimization           │

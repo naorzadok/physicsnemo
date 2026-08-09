@@ -60,6 +60,31 @@ from physicsnemo.nn.functional import knn
 NODE_FIELDS = ("coordinates", "normals", "area", "pressure", "shear_stress")
 
 
+def resolve_level_ratios(cfg) -> list[float] | None:
+    """Resolve cumulative multi-resolution level fractions from a config.
+
+    Shared by the trainer and the inference script so both build identical
+    graphs. Priority:
+
+      1. ``cfg.level_ratios``: explicit ascending cumulative fractions in
+         ``(0, 1]`` (e.g. ``[0.25, 0.5, 1.0]``).
+      2. ``cfg.num_levels`` (+ ``cfg.level_ratio``, default ``0.5``): geometric
+         levels, e.g. ``num_levels=3, level_ratio=0.5 -> [0.25, 0.5, 1.0]``.
+
+    Returns ``None`` when neither is configured, so callers fall back to the
+    legacy absolute ``cfg.num_nodes`` list.
+    """
+    ratios = cfg.get("level_ratios", None)
+    if ratios:
+        return [float(r) for r in ratios]
+    num_levels = cfg.get("num_levels", None)
+    if num_levels and int(num_levels) >= 1:
+        num_levels = int(num_levels)
+        ratio = float(cfg.get("level_ratio", 0.5))
+        return [ratio ** (num_levels - 1 - i) for i in range(num_levels)]
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Partitions are plain torch_geometric.data.Data objects, exactly like the
 # offline PartitionedGraph in dataloader.py. This matters: MeshGraphNet's
@@ -111,8 +136,9 @@ def build_knn_graph(
     src = torch.arange(n, device=coords.device).repeat_interleave(k)
 
     # Make undirected + coalesce (dedupe) with pure-torch ops (no pyg required).
+    # Self-loops are added to match the offline preprocessor (add_self_loops).
     edge_index = torch.stack([src, dst], dim=0)
-    edge_index = _to_undirected_coalesce(edge_index, n)
+    edge_index = _to_undirected_coalesce(edge_index, n, add_self_loops=True)
 
     row, col = edge_index
     disp = coords[row] - coords[col]
@@ -121,11 +147,23 @@ def build_knn_graph(
     return edge_index, edge_attr
 
 
-def _to_undirected_coalesce(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
-    """Symmetrize and de-duplicate edges using a linear-index sort (GPU friendly)."""
+def _to_undirected_coalesce(
+    edge_index: torch.Tensor, num_nodes: int, add_self_loops: bool = False
+) -> torch.Tensor:
+    """Symmetrize and de-duplicate edges using a linear-index sort (GPU friendly).
+
+    When ``add_self_loops`` is set, a ``(i, i)`` edge is added for every node
+    before deduplication, matching the offline preprocessor's
+    ``pyg.utils.add_self_loops``. The ``torch.unique`` on the packed keys makes
+    the self-loops idempotent (kNN never returns self, so no duplicates arise).
+    """
     src, dst = edge_index
     src2 = torch.cat([src, dst])
     dst2 = torch.cat([dst, src])
+    if add_self_loops:
+        loop = torch.arange(num_nodes, device=edge_index.device)
+        src2 = torch.cat([src2, loop])
+        dst2 = torch.cat([dst2, loop])
     keys = src2.to(torch.int64) * num_nodes + dst2.to(torch.int64)
     keys = torch.unique(keys)
     src_u = keys // num_nodes
@@ -180,8 +218,9 @@ def build_multilevel_knn_graph(
         if cum >= n:
             break
 
+    # Self-loops are added to match the offline preprocessor (add_self_loops).
     edge_index = torch.stack([torch.cat(srcs), torch.cat(dsts)], dim=0)
-    edge_index = _to_undirected_coalesce(edge_index, n)
+    edge_index = _to_undirected_coalesce(edge_index, n, add_self_loops=True)
     edge_attr = _edge_attr_from_index(coords, edge_index)
     return edge_index, edge_attr
 
@@ -365,11 +404,20 @@ class DynamicGraphBuilder:
         subsampled on the CPU to minimize the host->device transfer. Ignored
         when ``level_sizes`` is given.
     level_sizes
-        Optional list of per-level point counts (e.g. ``[10000, 20000, 40000]``)
-        enabling multi-resolution sampling: ``sum(level_sizes)`` nodes are drawn
-        and connected with cumulative kNN (see ``build_multilevel_knn_graph``),
-        adding long-range edges across resolutions. ``None`` keeps the
-        single-resolution kNN graph.
+        Legacy absolute multi-resolution spec: a list of per-level point count
+        *increments* (e.g. ``[10000, 20000, 40000]``). ``sum(level_sizes)`` nodes
+        are drawn and connected with cumulative kNN (see
+        ``build_multilevel_knn_graph``), adding long-range edges across
+        resolutions. Does not adapt to the cloud size and is capped at it. Prefer
+        ``level_ratios``. ``None`` keeps the single-resolution kNN graph.
+    level_ratios
+        Preferred, scale-invariant multi-resolution spec: ascending *cumulative*
+        fractions in ``(0, 1]`` of the available nodes, e.g. ``[0.25, 0.5, 1.0]``
+        for three levels. The finest level (last ratio, usually ``1.0``) is a
+        fixed fraction of whatever the cloud provides and the coarse levels are
+        nested sub-fractions of it, so the fine resolution never shrinks as more
+        coarse levels are added and the spec is independent of the raw cell
+        count. Takes precedence over ``level_sizes`` when both are given.
     mean, std
         Optional statistics dicts (e.g. loaded from ``global_stats.json``),
         keyed by the entries of ``NODE_FIELDS`` plus ``"x"`` for edge features
@@ -385,6 +433,12 @@ class DynamicGraphBuilder:
     feature-edge regions) are sampled more densely. The weights themselves are
     expected to be *precomputed* (stored alongside the raw cloud); computing
     mesh curvature on the fly would be CPU-bound and defeat the GPU pipeline.
+    The per-point ``area`` is emitted as the *raw* cell area. The unbiased
+    (Horvitz-Thompson) area weighting needed for surface integrals is applied
+    downstream, at integration time (the inference coefficient computation),
+    which divides by the sampling weight and rescales to the store's true total
+    surface area -- so it already accounts for any CPU/GPU subsampling without
+    the builder touching ``area``.
     """
 
     def __init__(
@@ -394,12 +448,14 @@ class DynamicGraphBuilder:
         halo_hops: int,
         num_target_nodes: int | None = None,
         level_sizes: list[int] | None = None,
+        level_ratios: list[float] | None = None,
         mean: dict | None = None,
         std: dict | None = None,
     ):
         self.node_degree = node_degree
         self.num_target_nodes = num_target_nodes
         self.level_sizes = list(level_sizes) if level_sizes else None
+        self.level_ratios = self._validate_ratios(level_ratios)
         self.num_partitions = num_partitions
         self.halo_hops = halo_hops
         self._mean_src = mean
@@ -407,6 +463,45 @@ class DynamicGraphBuilder:
         # Device-resident stat tensors, cached on first call.
         self._mean: dict[str, torch.Tensor] | None = None
         self._std: dict[str, torch.Tensor] | None = None
+
+    @staticmethod
+    def _validate_ratios(level_ratios: list[float] | None) -> list[float] | None:
+        """Validate and sort cumulative level fractions, or return ``None``."""
+        if not level_ratios:
+            return None
+        ratios = sorted(float(r) for r in level_ratios)
+        if ratios[0] <= 0.0 or ratios[-1] > 1.0:
+            raise ValueError(
+                "level_ratios must be ascending fractions in (0, 1]; "
+                f"got {level_ratios}"
+            )
+        return ratios
+
+    def _plan_levels(self, num_source: int) -> tuple[int, list[int] | None]:
+        """Resolve ``(draw_total, additive_level_sizes)`` for this cloud size.
+
+        ``level_ratios`` (preferred) are cumulative fractions of the *available*
+        nodes, so the finest level is always a fixed fraction (usually all) of
+        whatever the cloud provides and the coarse levels are nested
+        sub-fractions of it -- independent of the raw cell count. ``level_sizes``
+        keeps the legacy absolute increments (capped at the cloud size by
+        ``build_multilevel_knn_graph``). Otherwise a single resolution is used.
+        """
+        if self.level_ratios is not None:
+            # Cumulative prefix counts, then per-level increments.
+            cum = sorted(
+                {
+                    min(num_source, max(1, int(round(r * num_source))))
+                    for r in self.level_ratios
+                }
+            )
+            additive = [cum[0]] + [cum[i] - cum[i - 1] for i in range(1, len(cum))]
+            return cum[-1], additive
+        if self.level_sizes is not None:
+            return min(int(sum(self.level_sizes)), num_source), self.level_sizes
+        if self.num_target_nodes is not None and self.num_target_nodes < num_source:
+            return self.num_target_nodes, None
+        return num_source, None
 
     def _stats_on(self, device: torch.device) -> None:
         """Materialize (mean, std) as tensors on `device`, once."""
@@ -431,13 +526,24 @@ class DynamicGraphBuilder:
         weights: torch.Tensor | None,
         generator: torch.Generator | None,
         device: torch.device,
+        require_shuffle: bool = False,
     ) -> torch.Tensor:
         """Pick ``total`` node ids, importance-weighted when weights are given.
 
         With ``weights`` present, a ``multinomial`` draw (without replacement)
-        biases selection toward high-weight points. Otherwise falls back to a
-        uniform permutation. When ``total >= num_source`` and no weights are
-        given, every node is kept (identity order).
+        biases selection toward high-weight points. Otherwise selection is
+        uniform: a random permutation when subsampling, and -- unless
+        ``require_shuffle`` forces a shuffle -- identity order when every node is
+        kept. ``require_shuffle`` is set for the multi-resolution path, whose
+        nested prefixes are only valid uniform coarse subsamples of the whole
+        surface if the node order is randomized (the raw Zarr order is spatially
+        coherent, not shuffled).
+
+        Note: the per-point ``area`` is left as the raw cell area; the unbiased
+        (Horvitz-Thompson) area weighting for surface integrals is applied at
+        integration time in the inference coefficient computation, which also
+        rescales to the store's true total surface area and therefore already
+        accounts for any CPU/GPU subsampling.
         """
         if weights is not None:
             w = torch.as_tensor(weights, device=device, dtype=torch.float32).reshape(-1)
@@ -447,7 +553,11 @@ class DynamicGraphBuilder:
                 w, total, replacement=False, generator=generator
             )
         if total >= num_source:
-            return torch.arange(num_source, device=device)
+            return (
+                torch.randperm(num_source, generator=generator, device=device)
+                if require_shuffle
+                else torch.arange(num_source, device=device)
+            )
         return subsample_nodes(num_source, total, generator=generator, device=device)
 
     def __call__(
@@ -462,30 +572,35 @@ class DynamicGraphBuilder:
         num_source = raw["coordinates"].shape[0]
         weights = raw.get("sampling_weight")
 
-        # How many nodes to draw: multi-resolution sums the level sizes; the
-        # single-resolution path uses num_target_nodes (or the whole cloud).
-        if self.level_sizes is not None:
-            total = min(int(sum(self.level_sizes)), num_source)
-        elif self.num_target_nodes is not None and self.num_target_nodes < num_source:
-            total = self.num_target_nodes
-        else:
-            total = num_source
+        # Resolve the draw budget and per-level sizes. Ratio-based levels are
+        # scale-invariant (fractions of the available nodes); multilevel is on
+        # whenever more than one level results.
+        total, level_sizes = self._plan_levels(num_source)
+        multilevel = level_sizes is not None and len(level_sizes) > 1
 
         # Subsample nodes (per-step dynamics), importance-weighted if available.
-        idx = self._select_indices(num_source, total, weights, generator, device)
+        # Multi-resolution needs a shuffled order so the nested prefixes are
+        # valid uniform coarse subsamples of the whole surface.
+        idx = self._select_indices(
+            num_source, total, weights, generator, device, require_shuffle=multilevel
+        )
 
         # Build connectivity + edge features from RAW coordinates (normalization
         # is anisotropic and would change the neighbor set). Multi-resolution
         # relies on the draw order: the nested prefixes of idx are the levels.
         coords_raw = raw["coordinates"][idx]
-        if self.level_sizes is not None:
+        if multilevel:
             edge_index, edge_attr = build_multilevel_knn_graph(
-                coords_raw, self.level_sizes, self.node_degree
+                coords_raw, level_sizes, self.node_degree
             )
         else:
             edge_index, edge_attr = build_knn_graph(coords_raw, self.node_degree)
 
-        # Normalize node fields and edge features on-device.
+        # Node fields (including the raw cell ``area``) are carried through
+        # unchanged except for standardization. The unbiased area weighting for
+        # surface integrals is applied later, at integration time (inference
+        # coefficient computation), which rescales to the store's true total
+        # surface area and thus accounts for any subsampling.
         node_fields: dict[str, torch.Tensor] = {}
         for name in NODE_FIELDS:
             v = raw[name][idx]

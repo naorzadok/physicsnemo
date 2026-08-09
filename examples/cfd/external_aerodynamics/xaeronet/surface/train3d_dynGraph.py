@@ -51,7 +51,7 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
 
 from dataloader_dynGraph import create_raw_zarr_dataloader, find_zarr_stores
-from dynamic_graph_datapipe import DynamicGraphBuilder
+from dynamic_graph_datapipe import DynamicGraphBuilder, resolve_level_ratios
 from utils import (
     save_checkpoint,
     load_checkpoint,
@@ -120,12 +120,20 @@ def main(cfg: DictConfig) -> None:
     # GPU-side graph builder shared by train/val. Subsampling already happened on
     # the CPU worker, so the builder keeps every transferred node
     # (num_target_nodes=None) and only builds connectivity + normalizes.
-    #   - multi-resolution: automatically on when cfg.num_nodes lists more than
-    #     one level; the levels are drawn cumulatively and connected with
-    #     multi-scale kNN (adds long-range edges). A single-entry num_nodes
-    #     keeps the plain single-resolution kNN graph.
+    #   - multi-resolution: preferred, scale-invariant spec via (cfg.num_levels,
+    #     cfg.level_ratio) or an explicit cfg.level_ratios list of cumulative
+    #     fractions; the finest level is a fraction of the available nodes and the
+    #     coarse levels are nested sub-fractions (so the fine resolution never
+    #     shrinks as coarse levels are added). Falls back to the legacy absolute
+    #     cfg.num_nodes list when no ratios are configured. A single level keeps
+    #     the plain single-resolution kNN graph.
     #   - no_partition: emit the whole geometry as a single graph.
-    level_sizes = list(cfg.num_nodes) if len(cfg.num_nodes) > 1 else None
+    level_ratios = resolve_level_ratios(cfg)
+    level_sizes = (
+        None
+        if level_ratios is not None
+        else (list(cfg.num_nodes) if len(cfg.num_nodes) > 1 else None)
+    )
     num_partitions_eff = 1 if cfg.get("no_partition", False) else cfg.num_partitions
     graph_builder = DynamicGraphBuilder(
         node_degree=cfg.node_degree,
@@ -133,6 +141,7 @@ def main(cfg: DictConfig) -> None:
         halo_hops=cfg.num_message_passing_layers,
         num_target_nodes=None,
         level_sizes=level_sizes,
+        level_ratios=level_ratios,
         mean=mean,
         std=std,
     )

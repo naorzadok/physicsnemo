@@ -68,12 +68,76 @@ Example (batch conversion exercising every flag)::
         --no-global-params \\
         --split 80 10 10 --split-names train val test --split-seed 42 \\
         --compression-level 3 --chunk-mb 8.0 --overwrite \\
+        --sampling-weights --sampling-config conf/config3d.yaml \\
         --jobs 8 --timings --verbose
 
     # Single-sample conversion (explicit inputs, flat output):
     python3 vtk_to_zarr.py \\
         --stl geom.stl --surface boundary.vtp --volume internal.vtu \\
         --name case_001 --output-dir /data/out --no-split
+
+Importance-sampling weights
+---------------------------
+The dynamic-graph training pipeline can bias its per-step node subsampling toward
+high-curvature / feature-edge regions (where CFD gradients are strongest).  This
+is driven by an optional per-surface-point ``sampling_weight`` array precomputed
+here -- once, at conversion -- so the training step only does a cheap weighted
+draw and stays fully GPU-accelerated.  The array is aligned 1:1 with
+``surface_mesh_centers`` and is written together with a ``sampling_weight_cfg``
+attribute recording the parameters used (provenance).  It is optional: pipelines
+that do not find the array fall back to uniform sampling.
+
+Enable / produce the weights::
+
+    --sampling-weights                  Compute ``sampling_weight`` during
+                                        conversion (writes it into each store).
+    --backfill-sampling-weights PATH    Add ``sampling_weight`` to already-
+                                        converted store(s) at PATH (a single
+                                        .zarr or a directory tree) and exit;
+                                        rebuilds the STL from the stored
+                                        ``stl_*`` arrays.  ``--output-dir`` is
+                                        not required in this mode.  Combine with
+                                        ``--overwrite`` to replace existing
+                                        weights.
+
+Configure the weighting (precedence: built-in defaults < ``--sampling-config`` <
+explicit flags)::
+
+    --sampling-config YAML              Read the parameters from the ``sampling:``
+                                        block of a training config (e.g.
+                                        conf/config3d.yaml), so the Zarr weights
+                                        track the config without copying numbers.
+                                        Unknown keys (``strategy``,
+                                        ``debug_area_check``) are ignored.
+    --curvature-weight FLOAT            lambda: strength of the curvature bias
+                                        (higher -> denser at features).
+    --curvature-exponent FLOAT          Exponent applied to normalized curvature.
+    --curvature-clip-percentile FLOAT   Clip curvature at this percentile so a
+                                        few spikes do not dominate.
+    --curvature-smoothing-iterations N  Neighbor-averaging passes that denoise
+                                        per-vertex curvature (0 disables).
+    --feature-edge-weight FLOAT         Strength of the feature-edge proximity
+                                        bias (0 disables).
+    --feature-edge-angle FLOAT          Dihedral angle (deg) above which an edge
+                                        counts as a sharp feature.
+    --feature-edge-falloff FLOAT        Proximity falloff length as a fraction of
+                                        the mesh bounding-box diagonal.
+    --density-exponent FLOAT            Size-field contrast: density scales as
+                                        weight**p (>1 sharpens, <1 flattens).
+    --min-weight FLOAT                  Floor on the per-cell weight so smooth
+                                        regions are not starved.
+
+Examples::
+
+    # Backfill existing stores using the exact values from a training config:
+    python3 vtk_to_zarr.py \\
+        --backfill-sampling-weights /data/drivaer_zarr \\
+        --sampling-config conf/config3d.yaml
+
+    # Same, but override a single knob:
+    python3 vtk_to_zarr.py \\
+        --backfill-sampling-weights /data/drivaer_zarr \\
+        --sampling-config conf/config3d.yaml --min-weight 0.5 --overwrite
 """
 
 from __future__ import annotations
@@ -1392,15 +1456,29 @@ def build_parser() -> argparse.ArgumentParser:
             "replace existing weights."
         ),
     )
-    sampling.add_argument("--curvature-weight", type=float, default=SAMPLING_WEIGHT_DEFAULTS["curvature_weight"])
-    sampling.add_argument("--curvature-exponent", type=float, default=SAMPLING_WEIGHT_DEFAULTS["curvature_exponent"])
-    sampling.add_argument("--curvature-clip-percentile", type=float, default=SAMPLING_WEIGHT_DEFAULTS["curvature_clip_percentile"])
-    sampling.add_argument("--curvature-smoothing-iterations", type=int, default=int(SAMPLING_WEIGHT_DEFAULTS["curvature_smoothing_iterations"]))
-    sampling.add_argument("--feature-edge-weight", type=float, default=SAMPLING_WEIGHT_DEFAULTS["feature_edge_weight"])
-    sampling.add_argument("--feature-edge-angle", type=float, default=SAMPLING_WEIGHT_DEFAULTS["feature_edge_angle"])
-    sampling.add_argument("--feature-edge-falloff", type=float, default=SAMPLING_WEIGHT_DEFAULTS["feature_edge_falloff"])
-    sampling.add_argument("--density-exponent", type=float, default=SAMPLING_WEIGHT_DEFAULTS["density_exponent"])
-    sampling.add_argument("--min-weight", type=float, default=SAMPLING_WEIGHT_DEFAULTS["min_weight"])
+    sampling.add_argument(
+        "--sampling-config",
+        type=Path,
+        default=None,
+        metavar="YAML",
+        help=(
+            "Read weight parameters from the 'sampling:' block of a YAML config "
+            "(e.g. conf/config3d.yaml). Values seed the defaults; any explicit "
+            "--curvature-*/--feature-edge-*/etc. flag still overrides them."
+        ),
+    )
+    # Numeric knobs default to SUPPRESS so we can tell an explicit override from
+    # an unset flag (unset -> value comes from --sampling-config or the defaults).
+    _sd = SAMPLING_WEIGHT_DEFAULTS
+    sampling.add_argument("--curvature-weight", type=float, default=argparse.SUPPRESS, help=f"(default: {_sd['curvature_weight']})")
+    sampling.add_argument("--curvature-exponent", type=float, default=argparse.SUPPRESS, help=f"(default: {_sd['curvature_exponent']})")
+    sampling.add_argument("--curvature-clip-percentile", type=float, default=argparse.SUPPRESS, help=f"(default: {_sd['curvature_clip_percentile']})")
+    sampling.add_argument("--curvature-smoothing-iterations", type=int, default=argparse.SUPPRESS, help=f"(default: {int(_sd['curvature_smoothing_iterations'])})")
+    sampling.add_argument("--feature-edge-weight", type=float, default=argparse.SUPPRESS, help=f"(default: {_sd['feature_edge_weight']})")
+    sampling.add_argument("--feature-edge-angle", type=float, default=argparse.SUPPRESS, help=f"(default: {_sd['feature_edge_angle']})")
+    sampling.add_argument("--feature-edge-falloff", type=float, default=argparse.SUPPRESS, help=f"(default: {_sd['feature_edge_falloff']})")
+    sampling.add_argument("--density-exponent", type=float, default=argparse.SUPPRESS, help=f"(default: {_sd['density_exponent']})")
+    sampling.add_argument("--min-weight", type=float, default=argparse.SUPPRESS, help=f"(default: {_sd['min_weight']})")
 
     perf = parser.add_argument_group("performance")
     perf.add_argument(
@@ -1453,19 +1531,38 @@ def _resolve_samples(args: argparse.Namespace) -> list[Sample]:
     return samples
 
 
+def _load_sampling_config(path: Path) -> dict:
+    """Read weight parameters from the ``sampling:`` block of a YAML config.
+
+    Accepts either a full training config (reads its ``sampling`` mapping) or a
+    file that is itself the sampling mapping. Only the keys known to
+    ``SAMPLING_WEIGHT_DEFAULTS`` are picked up; extras (e.g. ``strategy``,
+    ``debug_area_check``) are ignored.
+    """
+    import yaml
+
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    block = data.get("sampling", data) if isinstance(data, dict) else None
+    if not isinstance(block, dict):
+        raise SystemExit(f"No 'sampling' mapping found in {path}")
+    cfg: dict = {}
+    for key in SAMPLING_WEIGHT_DEFAULTS:
+        if block.get(key) is not None:
+            cfg[key] = float(block[key])
+    return cfg
+
+
 def _sampling_cfg_from_args(args: argparse.Namespace) -> dict:
-    """Assemble the importance-sampling weight config from CLI args."""
-    return {
-        "curvature_weight": args.curvature_weight,
-        "curvature_exponent": args.curvature_exponent,
-        "curvature_clip_percentile": args.curvature_clip_percentile,
-        "curvature_smoothing_iterations": args.curvature_smoothing_iterations,
-        "feature_edge_weight": args.feature_edge_weight,
-        "feature_edge_angle": args.feature_edge_angle,
-        "feature_edge_falloff": args.feature_edge_falloff,
-        "density_exponent": args.density_exponent,
-        "min_weight": args.min_weight,
-    }
+    """Assemble the weight config: defaults < --sampling-config < explicit flags."""
+    cfg = dict(SAMPLING_WEIGHT_DEFAULTS)
+    if getattr(args, "sampling_config", None) is not None:
+        cfg.update(_load_sampling_config(args.sampling_config))
+    # SUPPRESS defaults mean an attribute exists only when the flag was passed.
+    for key in SAMPLING_WEIGHT_DEFAULTS:
+        if hasattr(args, key):
+            cfg[key] = getattr(args, key)
+    return cfg
 
 
 def main(argv: Sequence[str] | None = None) -> int:

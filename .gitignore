@@ -198,3 +198,9 @@ examples/cfd/external_aerodynamics/xaeronet/surface/_hmgn_smoke_test.py
 # Transformer models training run outputs
 examples/cfd/external_aerodynamics/transformer_models/runs/
 examples/cfd/external_aerodynamics/transformer_models/src/runs/
+
+# Root-level generated artifacts (dynamic-graph pipeline)
+/partitions/
+/validation_partitions/
+/global_stats.json
+examples/cfd/external_aerodynamics/xaeronet/surface/dynGraph.zip
