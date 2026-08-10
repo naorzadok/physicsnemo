@@ -10,6 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Adds a dynamic (on-the-fly) graph pipeline to the `xaeronet/surface` example
+  (`examples/cfd/external_aerodynamics/xaeronet/surface`), alongside the
+  existing offline `.bin` pipeline. It stores only the raw DoMINO surface point
+  cloud (via the new `vtk_to_zarr.py` converter) and rebuilds the kNN graph,
+  edge features and spatial partitions on the GPU every step
+  (`DynamicGraphBuilder` in `dynamic_graph_datapipe.py`, reusing
+  `physicsnemo.nn.functional.knn`), removing the multi-GB per-epoch edge I/O and
+  enabling free per-epoch resampling. Includes `train_dynamic.py`,
+  `dataloader_dynamic.py`, `compute_stats_dynamic.py`, `inference_dynamic.py`,
+  a scale-invariant multi-resolution config (`conf/config_dynamic.yaml`),
+  optional curvature/feature-edge importance sampling baked into the Zarr
+  stores, and optional per-sample global (parametric) features.
 - Promotes GeoTransolver out of `experimental` to
   `physicsnemo.models.geotransolver.GeoTransolver`, together with the FLARE
   model (`physicsnemo.models.flare.FLARE`) and the reusable GALE and FLARE

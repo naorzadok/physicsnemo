@@ -1,0 +1,470 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+This code defines a distributed training pipeline for training MeshGraphNet at scale,
+which operates on partitioned graph data for the AWS drivaer dataset. It includes
+loading partitioned graphs from .bin files, normalizing node and edge features using
+precomputed statistics, and training the model in parallel using DistributedDataParallel
+across multiple GPUs. The training loop involves computing predictions for each graph
+partition, calculating loss, and updating model parameters using mixed precision.
+Periodic checkpointing is performed to save the model, optimizer state, and training
+progress. Validation is also conducted every few epochs, where predictions are compared
+against ground truth values, and results are saved as point clouds. The code logs training
+and validation metrics to TensorBoard and optionally integrates with Weights and Biases for
+experiment tracking.
+"""
+
+import os
+import sys
+import json
+import pyvista as pv
+import torch
+import hydra
+import numpy as np
+from hydra.utils import to_absolute_path
+from torch.nn.parallel import DistributedDataParallel
+import torch.optim as optim
+from torch.amp import GradScaler
+from torch.utils.tensorboard import SummaryWriter
+from omegaconf import DictConfig
+
+from physicsnemo.distributed import DistributedManager
+# from physicsnemo.utils.logging.wandb import initialize_wandb
+from physicsnemo.models.meshgraphnet import MeshGraphNet
+
+# Get the absolute path to the parent directory
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(parent_dir)
+
+from dataloader_dynamic import create_raw_zarr_dataloader, find_zarr_stores
+from dynamic_graph_datapipe import DynamicGraphBuilder, resolve_level_ratios
+from utils import (
+    save_checkpoint,
+    load_checkpoint,
+    count_trainable_params,
+)
+
+
+@hydra.main(version_base="1.3", config_path="conf", config_name="config_dynamic")
+def main(cfg: DictConfig) -> None:
+    # Enable cuDNN auto-tuner
+    torch.backends.cudnn.benchmark = cfg.enable_cudnn_benchmark
+
+    # Instantiate the distributed manager
+    DistributedManager.initialize()
+    dist = DistributedManager()
+    device = dist.device
+    print(f"Rank {dist.rank} of {dist.world_size}")
+
+    # Instantiate the writers
+    if dist.rank == 0:
+        writer = SummaryWriter(log_dir="tensorboard")
+        # initialize_wandb(
+        #     project="aws_drivaer",
+        #     entity="PhysicsNeMo",
+        #     name="aws_drivaer",
+        #     mode="disabled",
+        #     group="group",
+        #     save_code=True,
+        # )
+
+    # AMP Configs
+    amp_dtype = torch.bfloat16
+    amp_device = "cuda"
+
+    # Discover the raw DoMINO surface Zarr stores.
+    train_dataset = find_zarr_stores(to_absolute_path(cfg.zarr_train_path))
+    valid_dataset = find_zarr_stores(to_absolute_path(cfg.zarr_valid_path))
+
+    # Prepare the stats
+    with open(to_absolute_path(cfg.stats_file), "r") as f:
+        stats = json.load(f)
+    mean = stats["mean"]
+    std = stats["std_dev"]
+
+    # Number of graph-level (global) features to append to each node's input.
+    # Derived from the stats file so it stays 0 for datasets/checkpoints that
+    # predate global features.
+    num_global_features = len(mean.get("global_features", []))
+
+    # Number of points to subsample per cloud on the CPU worker before the
+    # host->device copy. None keeps every point.
+    num_sampled_nodes = cfg.get("num_sampled_nodes", None)
+
+    # Raw-Zarr DataLoaders yield un-normalized per-point tensors; the graph,
+    # edge features and normalization are all built on the GPU by the builder.
+    train_dataloader = create_raw_zarr_dataloader(
+        train_dataset,
+        num_sampled_nodes=num_sampled_nodes,
+        batch_size=1,
+        shuffle=True,
+        use_ddp=True,
+        num_workers=cfg.get("num_dataloader_workers", 4),
+        deterministic=False,
+    )
+
+    # GPU-side graph builder shared by train/val. Subsampling already happened on
+    # the CPU worker, so the builder keeps every transferred node
+    # (num_target_nodes=None) and only builds connectivity + normalizes.
+    #   - multi-resolution: preferred, scale-invariant spec via (cfg.num_levels,
+    #     cfg.level_ratio) or an explicit cfg.level_ratios list of cumulative
+    #     fractions; the finest level is a fraction of the available nodes and the
+    #     coarse levels are nested sub-fractions (so the fine resolution never
+    #     shrinks as coarse levels are added). Falls back to the legacy absolute
+    #     cfg.num_nodes list when no ratios are configured. A single level keeps
+    #     the plain single-resolution kNN graph.
+    #   - no_partition: emit the whole geometry as a single graph.
+    level_ratios = resolve_level_ratios(cfg)
+    level_sizes = (
+        None
+        if level_ratios is not None
+        else (list(cfg.num_nodes) if len(cfg.num_nodes) > 1 else None)
+    )
+    num_partitions_eff = 1 if cfg.get("no_partition", False) else cfg.num_partitions
+    graph_builder = DynamicGraphBuilder(
+        node_degree=cfg.node_degree,
+        num_partitions=num_partitions_eff,
+        halo_hops=cfg.num_message_passing_layers,
+        num_target_nodes=None,
+        level_sizes=level_sizes,
+        level_ratios=level_ratios,
+        mean=mean,
+        std=std,
+    )
+
+    if dist.rank == 0:
+        validation_dataloader = create_raw_zarr_dataloader(
+            valid_dataset,
+            num_sampled_nodes=num_sampled_nodes,
+            batch_size=1,
+            shuffle=False,
+            use_ddp=False,
+            num_workers=cfg.get("num_dataloader_workers", 4),
+            deterministic=True,
+        )
+
+        print(f"Training dataset size: {len(train_dataloader) * dist.world_size}")
+        print(f"Validation dataset size: {len(validation_dataloader)}")
+
+    ######################################
+    # Training #
+    ######################################
+
+    # Initialize model
+    model = MeshGraphNet(
+        input_dim_nodes=24 + num_global_features,
+        input_dim_edges=4,
+        output_dim=4,
+        processor_size=cfg.num_message_passing_layers,
+        aggregation="sum",
+        hidden_dim_node_encoder=cfg.hidden_dim,
+        hidden_dim_edge_encoder=cfg.hidden_dim,
+        hidden_dim_node_decoder=cfg.hidden_dim,
+        mlp_activation_fn=cfg.activation,
+        do_concat_trick=cfg.use_concat_trick,
+        num_processor_checkpoint_segments=cfg.checkpoint_segments,
+    ).to(device)
+    print(f"Number of trainable parameters: {count_trainable_params(model)}")
+
+    # DistributedDataParallel wrapper
+    if dist.world_size > 1:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[dist.local_rank],
+            output_device=dist.device,
+            broadcast_buffers=dist.broadcast_buffers,
+            find_unused_parameters=dist.find_unused_parameters,
+            gradient_as_bucket_view=True,
+            static_graph=True,
+        )
+
+    # Optimizer and scheduler
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=2000, eta_min=1e-6
+    )
+    scaler = GradScaler()
+    print("Instantiated the model and optimizer")
+
+    # Check if there's a checkpoint to resume from
+    start_epoch, _ = load_checkpoint(
+        model, optimizer, scaler, scheduler, cfg.checkpoint_filename
+    )
+
+    # Training loop
+    print("Training started")
+    for epoch in range(start_epoch, cfg.num_epochs):
+        model.train()
+        total_loss = 0
+        for raw_list, _ in train_dataloader:
+            optimizer.zero_grad()
+            # TODO(akamenev): only batch size 1 is supported for now
+            raw = {
+                k: v.to(device, non_blocking=True) for k, v in raw_list[0].items()
+            }
+            # Build the (subsampled) kNN graph + partitions on the GPU. Fresh
+            # CPU subsampling each epoch provides the on-the-fly resampling.
+            graph_partitions = graph_builder(raw)
+
+            for part in graph_partitions:
+                with torch.autocast(amp_device, enabled=True, dtype=amp_dtype):
+                    part = part.to(device)
+                    node_features = [
+                        part.coordinates,
+                        part.normals,
+                        torch.sin(2 * np.pi * part.coordinates),
+                        torch.cos(2 * np.pi * part.coordinates),
+                        torch.sin(4 * np.pi * part.coordinates),
+                        torch.cos(4 * np.pi * part.coordinates),
+                        torch.sin(8 * np.pi * part.coordinates),
+                        torch.cos(8 * np.pi * part.coordinates),
+                    ]
+                    # Broadcast graph-level (global) features to every node.
+                    if "global_features" in part:
+                        node_features.append(
+                            part.global_features.expand(part.num_nodes, -1)
+                        )
+                    ndata = torch.cat(node_features, dim=1)
+                    pred = model(ndata, part.edge_attr, part)[part.inner_node]
+                    target = torch.cat((part.pressure, part.shear_stress), dim=1)[
+                        part.inner_node
+                    ]
+                    loss = torch.mean((pred - target) ** 2) / cfg.num_partitions
+                    total_loss += loss.item()
+                scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 32.0)
+            scaler.step(optimizer)
+            scaler.update()
+        scheduler.step()
+
+        # Log the training loss
+        if dist.rank == 0:
+            current_lr = optimizer.param_groups[0]["lr"]
+            num_mini_batches = len(train_dataloader)
+            print(
+                f"Epoch {epoch + 1}, "
+                f"Learning Rate: {current_lr}, "
+                f"Total Loss: {total_loss / num_mini_batches}"
+            )
+            writer.add_scalar("training_loss", total_loss / num_mini_batches, epoch)
+            writer.add_scalar("learning_rate", current_lr, epoch)
+
+        # Save checkpoint periodically
+        if (epoch) % cfg.save_checkpoint_freq == 0:
+            if dist.world_size > 1:
+                torch.distributed.barrier()
+            if dist.rank == 0:
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    scaler,
+                    scheduler,
+                    epoch + 1,
+                    loss.item(),
+                    cfg.checkpoint_filename,
+                )
+
+        ######################################
+        # Validation #
+        ######################################
+
+        if dist.rank == 0 and epoch % cfg.validation_freq == 0:
+            valid_loss = 0
+
+            for raw_list, id_list in validation_dataloader:
+                # TODO(akamenev): only batch size 1 is supported for now
+                raw = {
+                    k: v.to(device, non_blocking=True)
+                    for k, v in raw_list[0].items()
+                }
+                valid_id = id_list[0]
+
+                # Build the graph deterministically (CPU subsample is seeded).
+                valid_graph_partitions = graph_builder(raw)
+
+                # Full (subsampled) cloud size that part.part_node indexes into.
+                num_nodes = raw["coordinates"].shape[0]
+
+                # Initialize accumulators for predictions and node features
+                pressure_pred = torch.zeros(
+                    (num_nodes, 1), dtype=torch.float32, device=device
+                )
+                shear_stress_pred = torch.zeros(
+                    (num_nodes, 3), dtype=torch.float32, device=device
+                )
+                pressure_true = torch.zeros(
+                    (num_nodes, 1), dtype=torch.float32, device=device
+                )
+                shear_stress_true = torch.zeros(
+                    (num_nodes, 3), dtype=torch.float32, device=device
+                )
+                coordinates = torch.zeros(
+                    (num_nodes, 3), dtype=torch.float32, device=device
+                )
+                normals = torch.zeros(
+                    (num_nodes, 3), dtype=torch.float32, device=device
+                )
+                area = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
+
+                # Graph-level (global) features are identical across partitions,
+                # so capture them once. Stays None for legacy datasets without them.
+                global_features_norm = None
+
+                # Accumulate predictions and node features from all partitions
+                for part in valid_graph_partitions:
+                    part = part.to(device)
+
+                    # Capture the normalized global features once (same for all partitions)
+                    if global_features_norm is None and "global_features" in part:
+                        global_features_norm = part.global_features.clone()
+
+                    # Get node features (coordinates and normals)
+                    node_features = [
+                        part.coordinates,
+                        part.normals,
+                        torch.sin(2 * np.pi * part.coordinates),
+                        torch.cos(2 * np.pi * part.coordinates),
+                        torch.sin(4 * np.pi * part.coordinates),
+                        torch.cos(4 * np.pi * part.coordinates),
+                        torch.sin(8 * np.pi * part.coordinates),
+                        torch.cos(8 * np.pi * part.coordinates),
+                    ]
+                    # Broadcast graph-level (global) features to every node.
+                    if "global_features" in part:
+                        node_features.append(
+                            part.global_features.expand(part.num_nodes, -1)
+                        )
+                    ndata = torch.cat(node_features, dim=1)
+
+                    with torch.no_grad():
+                        with torch.autocast(amp_device, enabled=True, dtype=amp_dtype):
+                            pred = model(ndata, part.edge_attr, part)[part.inner_node]
+                            target = torch.cat(
+                                (part.pressure, part.shear_stress),
+                                dim=1,
+                            )[part.inner_node]
+                            loss = torch.mean((pred - target) ** 2) / cfg.num_partitions
+                            valid_loss += loss.item()
+
+                            # Store the predictions based on the original node IDs
+                            original_nodes = part.part_node[part.inner_node]
+
+                            # Accumulate the predictions
+                            pressure_pred[original_nodes] = pred[:, :1].clone().float()
+                            shear_stress_pred[original_nodes] = (
+                                pred[:, 1:].clone().float()
+                            )
+
+                            # Accumulate the ground truth
+                            pressure_true[original_nodes] = (
+                                target[:, :1].clone().float()
+                            )
+                            shear_stress_true[original_nodes] = (
+                                target[:, 1:].clone().float()
+                            )
+
+                            # Accumulate the node features
+                            coordinates[original_nodes] = (
+                                part.coordinates[part.inner_node].clone().float()
+                            )
+                            normals[original_nodes] = (
+                                part.normals[part.inner_node].clone().float()
+                            )
+                            area[original_nodes] = (
+                                part.area[part.inner_node].clone().float()
+                            )
+
+                # Denormalize predictions and node features using the global stats
+                pressure_pred_denorm = (
+                    pressure_pred.cpu() * torch.tensor(std["pressure"])
+                ) + torch.tensor(mean["pressure"])
+                shear_stress_pred_denorm = (
+                    shear_stress_pred.cpu() * torch.tensor(std["shear_stress"])
+                ) + torch.tensor(mean["shear_stress"])
+                pressure_true_denorm = (
+                    pressure_true.cpu() * torch.tensor(std["pressure"])
+                ) + torch.tensor(mean["pressure"])
+                shear_stress_true_denorm = (
+                    shear_stress_true.cpu() * torch.tensor(std["shear_stress"])
+                ) + torch.tensor(mean["shear_stress"])
+                coordinates_denorm = (
+                    coordinates.cpu() * torch.tensor(std["coordinates"])
+                ) + torch.tensor(mean["coordinates"])
+                normals_denorm = (
+                    normals.cpu() * torch.tensor(std["normals"])
+                ) + torch.tensor(mean["normals"])
+                area_denorm = (area.cpu() * torch.tensor(std["area"])) + torch.tensor(
+                    mean["area"]
+                )
+
+                # Denormalize the graph-level (global) features, if present
+                global_features_denorm = None
+                if global_features_norm is not None:
+                    global_features_denorm = (
+                        global_features_norm.cpu() * torch.tensor(std["global_features"])
+                    ) + torch.tensor(mean["global_features"])
+
+                # Save the full point cloud after accumulating all partition predictions
+                # Create a PyVista PolyData object for the point cloud
+                point_cloud = pv.PolyData(coordinates_denorm.numpy())
+                point_cloud["coordinates"] = coordinates_denorm.numpy()
+                point_cloud["normals"] = normals_denorm.numpy()
+                point_cloud["area"] = area_denorm.numpy()
+                point_cloud["pressure_pred"] = pressure_pred_denorm.numpy()
+                point_cloud["shear_stress_pred"] = shear_stress_pred_denorm.numpy()
+                point_cloud["pressure_true"] = pressure_true_denorm.numpy()
+                point_cloud["shear_stress_true"] = shear_stress_true_denorm.numpy()
+
+                # Store the denormalized global features as graph-level field data
+                # (single row), split into named fields.
+                if global_features_denorm is not None:
+                    global_values = global_features_denorm.squeeze(0).numpy()
+                    point_cloud.field_data["bbox_x"] = global_values[0:1]
+                    point_cloud.field_data["bbox_y"] = global_values[1:2]
+                    point_cloud.field_data["bbox_z"] = global_values[2:3]
+                    point_cloud.field_data["total_surface_area"] = global_values[3:4]
+
+                # Save the point cloud
+                point_cloud.save(f"point_cloud_{valid_id}.vtp")
+
+            num_valid_mini_batches = len(validation_dataloader)
+            print(
+                f"Epoch {epoch + 1}, Validation Error: {valid_loss / num_valid_mini_batches}"
+            )
+            writer.add_scalar(
+                "validation_loss", valid_loss / num_valid_mini_batches, epoch
+            )
+
+    # Save final checkpoint
+    if dist.world_size > 1:
+        torch.distributed.barrier()
+    if dist.rank == 0:
+        save_checkpoint(
+            model,
+            optimizer,
+            scaler,
+            scheduler,
+            cfg.num_epochs,
+            loss.item(),
+            "final_model_checkpoint.pth",
+        )
+        print("Training complete")
+
+
+if __name__ == "__main__":
+    main()

@@ -134,6 +134,60 @@ To train the XAeroNet-S model, follow these steps:
 
 ![XAeroNet-S Validation results for the sample #500.](../../../../docs/img/xaeronet_s_results.png)
 
+## Training XAeroNet-S with dynamic (on-the-fly) graphs
+
+The steps above use the offline pipeline: `preprocessor.py` samples point
+clouds, builds the kNN graph, runs a METIS partition and writes multi-GB
+`graph_partitions_*.bin` files that are re-read every epoch. An alternative
+**dynamic** pipeline is provided alongside it that stores only the *raw* surface
+point cloud (DoMINO Zarr) and rebuilds the graph, edge features and partitions
+**on the GPU every step**. This shrinks the dataset by roughly 10x (edges are
+regenerated instead of stored), removes the per-epoch edge I/O, and gives free
+per-epoch resampling as data augmentation. See
+[`surface/DYNAMIC_GRAPH_DESIGN.md`](surface/DYNAMIC_GRAPH_DESIGN.md) for the full
+rationale and performance analysis. The offline pipeline is unchanged; the
+dynamic scripts (`*_dynamic.py`, `vtk_to_zarr.py`, `conf/config_dynamic.yaml`)
+sit next to it and are opt-in.
+
+To train XAeroNet-S with the dynamic pipeline:
+
+1. Download the DrivAer ML dataset using the provided `download_aws_dataset.sh` script.
+
+2. Navigate to the `surface` folder.
+
+3. Convert the raw CFD files to per-sample DoMINO Zarr stores with
+   `vtk_to_zarr.py`. It reads STL/VTP/VTU inputs (only PyVista, NumPy, Zarr and
+   SciPy are required) and writes `train`/`val`/`test` subfolders of raw
+   per-point tensors. Pass `--sampling-weights --sampling-config
+   conf/config_dynamic.yaml` to additionally bake a per-point `sampling_weight`
+   array (curvature + feature-edge importance) used for biased node subsampling:
+
+   ```bash
+   python vtk_to_zarr.py \
+       --input-dir <raw_cfd_dir> --output-dir ./data/drivaer_zarr \
+       --sampling-weights --sampling-config conf/config_dynamic.yaml
+   ```
+
+4. Specify the configurations in `conf/config_dynamic.yaml` (set `zarr_train_path`
+   / `zarr_valid_path` to the folders produced above). The multi-resolution
+   graph is configured scale-invariantly via `num_levels` + `level_ratio` (or an
+   explicit `level_ratios` list) instead of the legacy absolute `num_nodes`.
+
+5. Run `compute_stats_dynamic.py` to compute the global mean/standard deviation
+   directly from the raw Zarr stores (node fields plus the on-the-fly edge
+   features).
+
+6. Run `train_dynamic.py` to start training. Multi-GPU training is supported; the
+   graph is built on the GPU each step by `DynamicGraphBuilder`.
+
+7. Run `inference_dynamic.py` to run inference with a fixed graph-build seed and,
+   optionally, write per-sample prediction point clouds and an aerodynamic
+   coefficient report.
+
+Optionally, run `visualize_sampling_weights.py <mesh.stl>` to write a `.vtp`
+that shows where the curvature/feature-edge weighting concentrates sampled
+points, for tuning the `sampling` knobs before conversion.
+
 ## XAeroNet-V prerequisites
 
 Install the requirements using:

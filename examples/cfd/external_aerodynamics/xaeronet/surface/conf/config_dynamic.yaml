@@ -1,0 +1,129 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2025 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+hydra:
+  job:
+    chdir: true
+    name: XAeroNetS
+  run:
+    dir: ./outputs/${hydra:job.name}
+
+# ┌───────────────────────────────────────────┐
+# │            Data Preprocessing             │
+# └───────────────────────────────────────────┘
+
+# Multi-resolution graph levels.
+# Preferred (dynamic pipeline): scale-invariant spec as a number of levels plus a
+# geometric ratio. The finest level is a fraction of the *available* nodes (after
+# the CPU subsample below) and coarser levels are nested sub-fractions of it, so
+# the fine resolution never shrinks as coarse levels are added and the spec is
+# independent of each run's cell count.
+#   num_levels=3, level_ratio=0.5  ->  cumulative fractions [0.25, 0.5, 1.0]
+# For an explicit spec instead, set `level_ratios` (ascending cumulative
+# fractions in (0, 1], last is the finest), e.g. level_ratios: [0.25, 0.5, 1.0].
+# Priority: level_ratios > (num_levels, level_ratio) > legacy num_nodes.
+num_levels: 3                                        # Number of resolution levels (dynamic pipeline)
+level_ratio: 0.5                                     # Geometric ratio between consecutive levels
+# level_ratios: [0.25, 0.5, 1.0]                     # Optional explicit cumulative fractions (overrides num_levels)
+
+num_nodes: [10000,20000,40000]                       # Legacy absolute per-level counts; used only as a fallback when no ratios are set
+node_degree: 6                                       # Degree of the nodes in the graphs
+num_partitions: 3                                    # Number of partitions for each graph
+data_path: ./data/drivaer_raw                        # Path to the raw CFD files (STL/VTP) for vtk_to_zarr.py
+num_preprocess_workers: 8                           # Number of workers for data preprocessing
+save_point_clouds: true                             # Save point clouds for the preprocessed data
+
+sampling:                                            # Boundary point sampling strategy
+  strategy: curvature                                     # "area" (uniform per unit area) or "curvature" (denser in high-curvature regions)
+  curvature_weight: 4.0                              # lambda: strength of curvature bias (higher -> denser at features)
+  curvature_exponent: 1.0                            # exponent applied to normalized curvature before weighting
+  curvature_clip_percentile: 95.0                    # clip curvature at this percentile to avoid a few spikes dominating
+  curvature_smoothing_iterations: 5                  # neighbor-averaging passes to denoise per-vertex curvature (0 disables)
+  feature_edge_weight: 2.0                            # strength of the feature-edge proximity bias (0 disables)
+  feature_edge_angle: 30.0                            # dihedral angle (deg) above which an edge is treated as a sharp feature
+  feature_edge_falloff: 0.02                          # proximity falloff length as a fraction of the mesh bounding-box diagonal
+  density_exponent: 1.0                               # size-field contrast: sampling density scales as weight^p (>1 sharpens, <1 flattens)
+  min_weight: 0.3                                    # floor on the per-cell weight so smooth regions are not starved
+  debug_area_check: true                             # log the Monte-Carlo total-area estimate vs true area to validate reweighting
+
+# ┌───────────────────────────────────────────┐
+# │           Model Configuration             │
+# └───────────────────────────────────────────┘
+
+num_message_passing_layers: 15                       # Number of message passing layers
+hidden_dim: 512                                      # Hidden dimension of the model
+activation: silu                                     # Activation function
+
+# ┌───────────────────────────────────────────┐
+# │          Training Configuration           │
+# └───────────────────────────────────────────┘
+
+# Dynamic (on-the-fly) graph pipeline: raw DoMINO surface Zarr stores produced by vtk_to_zarr.py.
+zarr_train_path: ./data/drivaer_zarr/train          # Dir of training *.zarr stores
+zarr_valid_path: ./data/drivaer_zarr/val            # Dir of validation *.zarr stores
+zarr_test_path: ./data/drivaer_zarr/val             # Dir of test *.zarr stores for inference_dynamic (defaults to the val dir)
+num_sampled_nodes: 100000                           # Points subsampled per cloud on the CPU worker before H2D transfer (null = keep all). This is the finest-level node count: with level_ratio the levels are fractions of it (e.g. 100000 -> [25000, 50000, 100000]). Set this to sample fewer than the full cloud (e.g. 8.8M -> 100000).
+num_dataloader_workers: 4                           # DataLoader workers for the raw-Zarr loader
+no_partition: false                                 # true -> whole geometry as a single graph (no spatial partitioning)
+
+stats_file: global_stats.json                       # Path to the global statistics (.json file)
+checkpoint_filename: model_checkpoint.pth           # Filename of the model checkpoint
+num_epochs: 10                                    # Number of epochs
+start_lr: 0.001                                     # Initial learning rate (cos annealing schedule is used)
+end_lr: 0.000001                                    # Final learning rate (cos annealing schedule is used)
+save_checkpoint_freq: 5                             # Frequency of saving the model checkpoint
+validation_freq: 50                                 # Frequency of validation
+
+# ┌───────────────────────────────────────────┐
+# │          Inference (dynamic graph)        │
+# └───────────────────────────────────────────┘
+
+inference_seed: 0                                   # Seed for the reproducible graph-build draw in inference_dynamic
+save_inference_clouds: true                         # Save a per-sample prediction point cloud (.vtp)
+make_inference_report: true                         # Write the coefficient metric report + scatter/heatmap plots (util_inference)
+global_feature_names: [alpha, beta, mach, reynolds] # Names of the per-sample global features; written to the VTP field data and used to label/color the report plots
+
+# ┌───────────────────────────────────────────┐
+# │        Performance Optimization           │
+# └───────────────────────────────────────────┘
+
+use_concat_trick: true                              # Use the concatenation trick
+checkpoint_segments: 3                              # Number of segments for the activation checkpointing
+enable_cudnn_benchmark: true                        # Enable cudnn benchmark
+
+# ┌───────────────────────────────────────────┐
+# │      Aerodynamic Coefficient Post-Proc    │
+# └───────────────────────────────────────────┘
+
+aero_coefficients:                                  # Integrate pre-normalized surface fields into force/moment coefficients
+  input_file: null                                  # Path to a single .vtp file (null to use input_dir)
+  input_dir: null                                   # Directory scanned for *.vtp files (null to use input_file)
+  coordinates_key: coordinates                      # Point-data array name for coordinates (falls back to mesh points)
+  normals_key: normals                              # Point-data array name for surface unit normals
+  area_key: area                                    # Point-data array name for per-point tributary area
+  pressure_key: pressure                            # Point-data array name for the normalized pressure (Cp)
+  shear_stress_key: shear_stress                    # Point-data array name for the normalized wall shear stress vector
+  mrc: [0.0, 0.0, 0.0]                              # Moment reference center (x, y, z)
+  convention: alpha_beta                            # "alpha_beta" or "alpha_phi" (aeroballistic total-AoA + roll)
+  alpha: 0.0                                        # Body-axis pitch angle of attack in degrees (used when convention=alpha_beta)
+  beta: 0.0                                         # Sideslip angle in degrees (used when convention=alpha_beta)
+  alpha_total: 0.0                                  # Total angle of attack in degrees (used when convention=alpha_phi)
+  phi_aerodynamic: 0.0                              # Aerodynamic roll angle in degrees (used when convention=alpha_phi)
+  output_frame: both                                # Coefficient frame(s) to report: "body", "wind" or "both"
+  ref_area: 1.0                                     # Reference area for force coefficients (1.0 since fields are pre-normalized)
+  ref_length: 1.0                                   # Reference length for moment coefficients
+  compute: true                                     # inference_dynamic: integrate CL/CD/CM per sample + report R^2 / Normalized_fit_score
+  report_optional_coeffs: false                     # Also report side force (CY) and roll/yaw moments (Cl, Cn)

@@ -6,3 +6,6 @@ wandb
 scikit-learn
 tabulate
 matplotlib
+zarr>=3.0
+scipy
+tqdm
