@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Adds geometry-aware importance sampling of mesh cells to
+  `physicsnemo.mesh.sampling`: `compute_curvature_sampling_weights` derives
+  per-cell weights from surface curvature (computed with the native
+  `physicsnemo.mesh.curvature` module), and `sample_cells_by_weight` draws cell
+  indices proportional to any per-cell weight vector. Both are pure PyTorch with
+  no optional dependencies. The drawn indices compose with
+  `sample_random_points_on_cells` to concentrate samples in high-gradient
+  regions instead of uniform area weighting.
 - Adds the experimental Strata weather-emulation models —
   `physicsnemo.experimental.models.strata.Strata` and `StrataTransformer3D` — plus
   the continuous / stereographic RoPE helpers `build_rope_cos_sin_1d_continuous`,

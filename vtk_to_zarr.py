@@ -612,8 +612,9 @@ def read_volume(source, specs, location_mode: str) -> dict[str, np.ndarray]:
 # subsampling toward high-curvature / feature-edge regions (where CFD gradients
 # are strongest), so the GNN can resolve hard physics. Computing them here (once,
 # at conversion) keeps training fully GPU-accelerated: the training step only
-# does a cheap weighted draw using this array. The logic mirrors
-# ``preprocessor3d.py`` but is self-contained (PyVista + NumPy + SciPy only).
+# does a cheap weighted draw using this array. The curvature term is computed
+# with the internal ``physicsnemo.mesh.sampling`` library; the feature-edge
+# proximity term uses PyVista + SciPy.
 
 SAMPLING_WEIGHT_DEFAULTS: dict[str, float] = {
     "curvature_weight": 4.0,
@@ -639,57 +640,15 @@ def _polydata_from_stl_arrays(
     return pv.PolyData(np.asarray(coords, dtype=np.float32), vtk_faces)
 
 
-def _smooth_point_scalar(
-    mesh: "pv.PolyData", values: np.ndarray, iterations: int
-) -> np.ndarray:
-    """Umbrella (neighbor-average) smoothing of a per-vertex scalar field."""
-    if iterations <= 0:
-        return values
-    faces = mesh.regular_faces
-    edges = np.vstack([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
-    n_points = mesh.n_points
-    smoothed = values.astype(np.float64, copy=True)
-    for _ in range(iterations):
-        summed = np.zeros(n_points, dtype=np.float64)
-        counts = np.zeros(n_points, dtype=np.float64)
-        np.add.at(summed, edges[:, 0], smoothed[edges[:, 1]])
-        np.add.at(summed, edges[:, 1], smoothed[edges[:, 0]])
-        np.add.at(counts, edges[:, 0], 1.0)
-        np.add.at(counts, edges[:, 1], 1.0)
-        nz = counts > 0
-        smoothed[nz] = summed[nz] / counts[nz]
-    return smoothed
+def _physicsnemo_mesh_from_polydata(mesh: "pv.PolyData"):
+    """Build a physicsnemo :class:`~physicsnemo.mesh.mesh.Mesh` from a triangular
+    ``pv.PolyData`` so curvature can be computed with the native library."""
+    import torch
+    from physicsnemo.mesh.mesh import Mesh
 
-
-def _cell_curvature_weights(mesh: "pv.PolyData", cfg: dict) -> np.ndarray:
-    """Normalized ``[0, 1]`` per-cell maximum-curvature importance."""
-    clip_percentile = float(cfg.get("curvature_clip_percentile", 95.0))
-    smoothing_iterations = int(cfg.get("curvature_smoothing_iterations", 0))
-
-    # vtkCurvatures spams per-point warnings on faceted STL triangles; silence.
-    try:
-        import vtk
-
-        prev = vtk.vtkObject.GetGlobalWarningDisplay()
-        vtk.vtkObject.GlobalWarningDisplayOff()
-    except Exception:
-        vtk = None
-        prev = None
-    try:
-        point_curv = np.abs(mesh.curvature(curv_type="maximum"))
-    finally:
-        if vtk is not None and prev is not None:
-            vtk.vtkObject.SetGlobalWarningDisplay(prev)
-
-    point_curv = np.nan_to_num(point_curv, nan=0.0, posinf=0.0, neginf=0.0)
-    point_curv = _smooth_point_scalar(mesh, point_curv, smoothing_iterations)
-
-    cell_curv = point_curv[mesh.regular_faces].mean(axis=1)
-    clip_value = np.percentile(cell_curv, clip_percentile)
-    if clip_value > 0:
-        cell_curv = np.clip(cell_curv, 0.0, clip_value)
-    max_curv = cell_curv.max()
-    return cell_curv / max_curv if max_curv > 0 else np.zeros_like(cell_curv)
+    points = torch.as_tensor(np.asarray(mesh.points, dtype=np.float32))
+    cells = torch.as_tensor(np.asarray(mesh.regular_faces, dtype=np.int64))
+    return Mesh(points=points, cells=cells)
 
 
 def _cell_edge_weights(mesh: "pv.PolyData", cfg: dict) -> np.ndarray:
@@ -720,16 +679,46 @@ def _cell_edge_weights(mesh: "pv.PolyData", cfg: dict) -> np.ndarray:
 
 
 def _cell_sampling_weights(mesh: "pv.PolyData", cfg: dict) -> np.ndarray:
-    """Combine curvature + feature-edge importance into a per-cell weight."""
+    """Combine curvature + feature-edge importance into a per-cell weight.
+
+    The curvature contribution is computed with the native
+    :func:`physicsnemo.mesh.sampling.compute_curvature_sampling_weights`
+    (reconstructing the maximum principal curvature from the internal
+    ``physicsnemo.mesh.curvature`` module) rather than ``vtkCurvatures``. The
+    feature-edge proximity term is then blended in on top, preserving the
+    original ``1 + lambda_curv * curv**p + lambda_edge * edge`` weighting.
+    """
+    from physicsnemo.mesh.sampling import compute_curvature_sampling_weights
+
     lam_curv = float(cfg.get("curvature_weight", 4.0))
     exponent = float(cfg.get("curvature_exponent", 1.0))
     lam_edge = float(cfg.get("feature_edge_weight", 0.0))
     density_exponent = float(cfg.get("density_exponent", 1.0))
     min_weight = float(cfg.get("min_weight", 0.3))
 
-    weights = np.ones(mesh.n_cells)
-    if lam_curv > 0:
-        weights = weights + lam_curv * (_cell_curvature_weights(mesh, cfg) ** exponent)
+    # Curvature baseline (1 + lambda_curv * curvature**p) from the internal
+    # library. Defer the density exponent and min-weight floor so the optional
+    # feature-edge term is folded in first, matching the original combination.
+    pn_mesh = _physicsnemo_mesh_from_polydata(mesh)
+    weights = (
+        compute_curvature_sampling_weights(
+            pn_mesh,
+            curvature_weight=lam_curv,
+            curvature_exponent=exponent,
+            curvature_clip_percentile=float(
+                cfg.get("curvature_clip_percentile", 95.0)
+            ),
+            curvature_smoothing_iterations=int(
+                cfg.get("curvature_smoothing_iterations", 0)
+            ),
+            density_exponent=1.0,
+            min_weight=0.0,
+        )
+        .cpu()
+        .numpy()
+        .astype(np.float64)
+    )
+
     if lam_edge > 0:
         weights = weights + lam_edge * _cell_edge_weights(mesh, cfg)
     if density_exponent != 1.0:
