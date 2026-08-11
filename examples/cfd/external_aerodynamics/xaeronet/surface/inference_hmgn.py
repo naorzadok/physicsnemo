@@ -37,7 +37,7 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(parent_dir)
 
 from dataloader import create_dataloader
-from hypermeshgraphnet import HyperMeshGraphNet
+from physicsnemo.models.meshgraphnet import FiLMMeshGraphNet
 from utils import (
     find_bin_files,
     count_trainable_params,
@@ -119,7 +119,7 @@ def main(cfg: DictConfig) -> None:
     num_global_features = len(mean.get("global_features", []))
     if num_global_features == 0:
         raise ValueError(
-            "HyperMeshGraphNet requires global features, but none were found in "
+            "FiLMMeshGraphNet requires global features, but none were found in "
             "the stats file ('global_features'). Use inference.py for models "
             "without global features."
         )
@@ -155,7 +155,7 @@ def main(cfg: DictConfig) -> None:
     # Initialize model. The 24 per-node geometry features are the node inputs;
     # the global (flow) conditions are passed separately and modulate the
     # processor via FiLM, so they are NOT concatenated onto the node inputs.
-    model = HyperMeshGraphNet(
+    model = FiLMMeshGraphNet(
         input_dim_nodes=24,
         input_dim_edges=4,
         input_dim_global=num_global_features,
